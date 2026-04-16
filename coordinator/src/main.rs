@@ -86,6 +86,7 @@ struct Args {
 
 // ── Packet serialization (v2) ───────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_packet(
     send_time_us: i64,
     next_downbeat_us: i64,
@@ -125,7 +126,11 @@ fn build_packet(
 
 // ── Compute next downbeat time from Link ────────────────────────────
 
-fn next_downbeat_time(session: &SessionState, now: chrono::Duration, quantum: f64) -> chrono::Duration {
+fn next_downbeat_time(
+    session: &SessionState,
+    now: chrono::Duration,
+    quantum: f64,
+) -> chrono::Duration {
     let phase = session.phase_at_time(now, quantum);
     let epsilon = 0.001;
     let beats_until_downbeat = if phase <= epsilon {
@@ -144,7 +149,7 @@ fn next_downbeat_time(session: &SessionState, now: chrono::Duration, quantum: f6
 fn on_air_to_mask(channels: &HashMap<u8, bool>) -> u8 {
     let mut mask: u8 = 0;
     for (&ch, &active) in channels {
-        if active && ch >= 1 && ch <= 8 {
+        if active && (1..=8).contains(&ch) {
             mask |= 1 << (ch - 1);
         }
     }
@@ -185,12 +190,7 @@ impl BeatSourceState {
 
     /// Update CDJ state from a master beat. The caller must filter to
     /// master-only beats before calling this.
-    fn process_master_beat(
-        &mut self,
-        beat: &prodjlink_rs::Beat,
-        now: Instant,
-        link_clock_us: i64,
-    ) {
+    fn process_master_beat(&mut self, beat: &prodjlink_rs::Beat, now: Instant, link_clock_us: i64) {
         self.last_cdj_beat_time = now;
         self.cdj_bpm = beat.effective_tempo();
         self.cdj_beat_in_bar = if beat.beat_within_bar > 0 {
@@ -261,7 +261,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     port.clear(serialport::ClearBuffer::All)?;
 
     // Initialize Ableton Link
-    info!(bpm = args.bpm, quantum = args.quantum, "starting Ableton Link");
+    info!(
+        bpm = args.bpm,
+        quantum = args.quantum,
+        "starting Ableton Link"
+    );
     let mut link = BasicLink::new(args.bpm).await;
     link.enable().await;
 
@@ -279,8 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interface = ?args.interface,
             "starting DJ Link"
         );
-        let mut builder = ProDjLink::builder()
-            .device_number(args.device_number);
+        let mut builder = ProDjLink::builder().device_number(args.device_number);
         if let Some(ip) = args.interface {
             builder = builder.interface_address(ip);
         }
@@ -308,7 +311,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Beat source state
     let mut state = BeatSourceState::new();
 
-    info!("coordinator running — broadcasting v2 packets at {}Hz", args.rate);
+    info!(
+        "coordinator running — broadcasting v2 packets at {}Hz",
+        args.rate
+    );
 
     let interval = Duration::from_micros(1_000_000 / args.rate as u64);
     let quantum = args.quantum;
@@ -323,16 +329,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(event) = rx.try_recv() {
                 if let BeatEvent::NewBeat(beat) = event {
                     // Only use beats from the master player
-                    let is_master = pdl.as_ref()
-                        .map(|p| p.virtual_cdj().tempo_master().master_device())
-                        .flatten()
-                        .map_or(false, |d| d == beat.device_number);
+                    let is_master = pdl
+                        .as_ref()
+                        .and_then(|p| p.virtual_cdj().tempo_master().master_device())
+                        .is_some_and(|d| d == beat.device_number);
 
                     if is_master {
                         let now_instant = Instant::now();
-                        let now_us = link.clock().micros()
-                            .num_microseconds()
-                            .unwrap_or(0);
+                        let now_us = link.clock().micros().num_microseconds().unwrap_or(0);
 
                         state.process_master_beat(&beat, now_instant, now_us);
 
@@ -361,8 +365,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(ref mut rx) = on_air_rx {
             while let Ok(on_air) = rx.try_recv() {
-                let channels: HashMap<u8, bool> = on_air.channels.iter().map(|(&k, &v)| (k, v)).collect();
-                let active: Vec<u8> = channels.iter()
+                let channels: HashMap<u8, bool> =
+                    on_air.channels.iter().map(|(&k, &v)| (k, v)).collect();
+                let active: Vec<u8> = channels
+                    .iter()
                     .filter(|(_, v)| **v)
                     .map(|(&k, _)| k)
                     .collect();
@@ -387,7 +393,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let (tempo, beat_in_bar, next_db_us, next_bt_us, is_playing) = if cdj_active {
             // CDJ is authoritative
-            (state.cdj_bpm, state.cdj_beat_in_bar, state.cdj_next_bar_us, state.cdj_next_beat_us, true)
+            (
+                state.cdj_bpm,
+                state.cdj_beat_in_bar,
+                state.cdj_next_bar_us,
+                state.cdj_next_beat_us,
+                true,
+            )
         } else {
             // Link-only fallback
             let phase = session.phase_at_time(now, quantum);
@@ -399,7 +411,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let current_beat = session.beat_at_time(now, quantum);
             let next_beat_time = session.time_at_beat(current_beat + beats_until_next, quantum);
             let next_bt_us = next_beat_time.num_microseconds().unwrap_or(0);
-            (session.tempo(), beat, next_db_us, next_bt_us, session.is_playing())
+            (
+                session.tempo(),
+                beat,
+                next_db_us,
+                next_bt_us,
+                session.is_playing(),
+            )
         };
 
         // Track bar transitions
@@ -411,8 +429,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let send_time_us = now.num_microseconds().expect("coordinator clock overflow");
 
         let mut flags: u8 = 0;
-        if is_playing { flags |= FLAG_PLAYING; }
-        if cdj_active { flags |= FLAG_CDJ_ACTIVE; }
+        if is_playing {
+            flags |= FLAG_PLAYING;
+        }
+        if cdj_active {
+            flags |= FLAG_CDJ_ACTIVE;
+        }
 
         let on_air_mask = state.on_air_mask();
         let master_dev = if cdj_active { state.master_device } else { 0 };
@@ -489,7 +511,16 @@ mod tests {
         let send_time: i64 = 123_456_789;
         let next_db: i64 = 234_567_890;
         let next_bt: i64 = 150_000_000;
-        let pkt = build_packet(send_time, next_db, 12630, 2, FLAG_PLAYING | FLAG_CDJ_ACTIVE, next_bt, 0b0011, 1);
+        let pkt = build_packet(
+            send_time,
+            next_db,
+            12630,
+            2,
+            FLAG_PLAYING | FLAG_CDJ_ACTIVE,
+            next_bt,
+            0b0011,
+            1,
+        );
 
         // Parse back
         let parsed_send = i64::from_le_bytes(pkt[4..12].try_into().unwrap());
@@ -561,8 +592,8 @@ mod tests {
 
     // ── BeatSourceState tests ──────────────────────────────────────
 
-    use prodjlink_rs::{Bpm, DeviceNumber, DeviceType, Pitch};
     use prodjlink_rs::protocol::beat::Beat;
+    use prodjlink_rs::{Bpm, DeviceNumber, DeviceType, Pitch};
 
     fn make_test_beat(device: u8, bpm: f64, beat_within_bar: u8) -> Beat {
         Beat {
@@ -678,7 +709,9 @@ mod tests {
 
         let cdj_active = state.is_cdj_active(now);
         let mut flags: u8 = 0;
-        if cdj_active { flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE; }
+        if cdj_active {
+            flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE;
+        }
 
         let packet = build_packet(
             link_clock_us,
@@ -695,7 +728,10 @@ mod tests {
         let mut dongle = DongleSim::new();
         let forwarded = dongle.feed_bytes(&packet);
         assert_eq!(forwarded.len(), 1, "dongle must forward the packet");
-        assert_eq!(dongle.crc_errors, 0, "coordinator CRC must match firmware CRC");
+        assert_eq!(
+            dongle.crc_errors, 0,
+            "coordinator CRC must match firmware CRC"
+        );
         assert_eq!(dongle.version_errors, 0);
 
         // Wristband: parse + clock offset
@@ -742,7 +778,7 @@ mod tests {
         let (_state, _pkt, wb) = pipeline(&beat, None);
 
         assert_eq!(wb.beat_in_bar, 2); // 3 (1-based) → 2 (0-based)
-        // beat_in_bar != 0 and next_beat_us != next_downbeat_us
+                                       // beat_in_bar != 0 and next_beat_us != next_downbeat_us
         assert!(!wb.is_next_downbeat() || wb.next_beat_us == wb.next_downbeat_us);
     }
 
@@ -841,7 +877,9 @@ mod tests {
 
             let cdj_active = state.is_cdj_active(now);
             let mut flags: u8 = 0;
-            if cdj_active { flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE; }
+            if cdj_active {
+                flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE;
+            }
 
             let packet = build_packet(
                 link_us,
@@ -850,7 +888,8 @@ mod tests {
                 state.cdj_beat_in_bar,
                 flags,
                 state.cdj_next_beat_us,
-                0, 0,
+                0,
+                0,
             );
 
             let forwarded = dongle.feed_bytes(&packet);
@@ -877,9 +916,14 @@ mod tests {
         state.process_master_beat(&beat, now, 10_000_000);
 
         let packet = build_packet(
-            10_000_000, state.cdj_next_bar_us,
-            12000, 0, FLAG_PLAYING | FLAG_CDJ_ACTIVE,
-            state.cdj_next_beat_us, 0, 1,
+            10_000_000,
+            state.cdj_next_bar_us,
+            12000,
+            0,
+            FLAG_PLAYING | FLAG_CDJ_ACTIVE,
+            state.cdj_next_beat_us,
+            0,
+            1,
         );
 
         // Corrupt the first packet
@@ -904,9 +948,14 @@ mod tests {
         // Verify that the coordinator's CRC (crc crate with custom algo)
         // matches the firmware's CRC (manual bit-banging) for a real packet.
         let packet = build_packet(
-            99_999_999, 199_999_999, 12630, 2,
+            99_999_999,
+            199_999_999,
+            12630,
+            2,
             FLAG_PLAYING | FLAG_CDJ_ACTIVE,
-            149_999_999, 0b0000_0101, 3,
+            149_999_999,
+            0b0000_0101,
+            3,
         );
 
         // Coordinator CRC
@@ -915,10 +964,20 @@ mod tests {
         // Firmware CRC (via DongleSim which uses the manual implementation)
         let mut dongle = DongleSim::new();
         let forwarded = dongle.feed_bytes(&packet);
-        assert_eq!(forwarded.len(), 1, "CRC must match — coordinator and firmware agree");
-        assert_eq!(dongle.crc_errors, 0, "zero CRC errors confirms cross-compatibility");
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "CRC must match — coordinator and firmware agree"
+        );
+        assert_eq!(
+            dongle.crc_errors, 0,
+            "zero CRC errors confirms cross-compatibility"
+        );
 
         // Also verify the CRC byte is non-trivial
-        assert_ne!(coord_crc, 0x00, "CRC should be non-trivial for this payload");
+        assert_ne!(
+            coord_crc, 0x00,
+            "CRC should be non-trivial for this payload"
+        );
     }
 }

@@ -262,6 +262,7 @@ mod tests {
 
     // ── Helper: build a valid v2 packet ─────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn make_packet(
         send_time_us: i64,
         next_downbeat_us: i64,
@@ -291,7 +292,16 @@ mod tests {
     }
 
     fn make_default_packet() -> [u8; PACKET_SIZE] {
-        make_packet(1_000_000, 2_000_000, 12000, 0, FLAG_PLAYING, 1_500_000, 0, 0)
+        make_packet(
+            1_000_000,
+            2_000_000,
+            12000,
+            0,
+            FLAG_PLAYING,
+            1_500_000,
+            0,
+            0,
+        )
     }
 
     // ── CRC golden vectors ──────────────────────────────────────────
@@ -344,7 +354,7 @@ mod tests {
         let mut dongle = DongleSim::new();
         let mut pkt = make_default_packet();
         pkt[2] = 0x01; // wrong version
-        // Recompute CRC for the corrupted version so we test version check, not CRC
+                       // Recompute CRC for the corrupted version so we test version check, not CRC
         pkt[35] = firefly_crc8(&pkt[2..35]);
         let results = dongle.feed_bytes(&pkt);
         assert!(results.is_empty());
@@ -379,7 +389,16 @@ mod tests {
     fn back_to_back_packets() {
         let mut dongle = DongleSim::new();
         let pkt1 = make_packet(100, 200, 12000, 0, FLAG_PLAYING, 150, 0, 0);
-        let pkt2 = make_packet(300, 400, 12800, 1, FLAG_PLAYING | FLAG_CDJ_ACTIVE, 350, 0b11, 2);
+        let pkt2 = make_packet(
+            300,
+            400,
+            12800,
+            1,
+            FLAG_PLAYING | FLAG_CDJ_ACTIVE,
+            350,
+            0b11,
+            2,
+        );
         let mut data = Vec::new();
         data.extend_from_slice(&pkt1);
         data.extend_from_slice(&pkt2);
@@ -409,10 +428,10 @@ mod tests {
     fn parse_all_fields_correctly() {
         let mut wb = WristbandSim::new();
         let pkt = make_packet(
-            1_000_000,   // send_time
-            2_000_000,   // next_downbeat
-            12800,       // 128.00 BPM
-            2,           // beat_in_bar
+            1_000_000, // send_time
+            2_000_000, // next_downbeat
+            12800,     // 128.00 BPM
+            2,         // beat_in_bar
             FLAG_PLAYING | FLAG_CDJ_ACTIVE,
             1_500_000,   // next_beat
             0b0000_0101, // on_air: ch1 + ch3
@@ -524,7 +543,9 @@ mod tests {
         );
         wb.receive_packet(&pkt, 1_000_000);
 
-        let flash = wb.next_flash_local_us().expect("should fall back to downbeat");
+        let flash = wb
+            .next_flash_local_us()
+            .expect("should fall back to downbeat");
         let expected = wb.to_local_time(2_000_000);
         assert_eq!(flash, expected);
     }
@@ -533,14 +554,8 @@ mod tests {
     fn not_playing_returns_no_flash() {
         let mut wb = WristbandSim::new();
         let pkt = make_packet(
-            1_000_000,
-            2_000_000,
-            12000,
-            0,
-            0, // not playing
-            1_500_000,
-            0,
-            0,
+            1_000_000, 2_000_000, 12000, 0, 0, // not playing
+            1_500_000, 0, 0,
         );
         wb.receive_packet(&pkt, 1_000_000);
         assert!(wb.next_flash_local_us().is_none());
