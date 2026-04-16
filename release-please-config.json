@@ -1,0 +1,8 @@
+{
+  "packages": {
+    "coordinator": {
+      "release-type": "rust",
+      "component": "firefly-coordinator"
+    }
+  }
+}
