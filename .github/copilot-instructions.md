@@ -12,6 +12,9 @@ Beat-synced LED wristbands: Pioneer DJ Link → Rust coordinator → USB serial 
 | `dongle-firmware/` | Arduino C++ | `arduino-cli` (board: `esp32:esp32:XIAO_ESP32C3`) |
 | `wristband-firmware/` | Arduino C++ | `arduino-cli` (board: `esp32:esp32:XIAO_ESP32C3`) |
 | `shared/protocol.h` | C header | Included by all three components |
+| `shared/dongle_logic.h` | C header | Extracted dongle serial framing state machine (testable without ESP32) |
+| `shared/wristband_logic.h` | C header | Extracted wristband packet parsing + clock offset EMA (testable without ESP32) |
+| `tests/` | C++ | Native host tests (`g++`, no hardware needed) |
 
 ## Validation Requirements
 
@@ -26,9 +29,12 @@ arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 dongle-firmware/
 
 # 3. Wristband firmware compilation
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 wristband-firmware/
+
+# 4. Firmware native tests (C++)
+cd tests && g++ -std=c++17 -Wall -Wextra -o test_firmware test_firmware.cpp && ./test_firmware
 ```
 
-All three must pass with zero errors before committing.
+All four must pass with zero errors before committing.
 
 ## Arduino Conventions
 

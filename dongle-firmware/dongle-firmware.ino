@@ -11,6 +11,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "../shared/protocol.h"
+#include "../shared/dongle_logic.h"
 
 // ESP-NOW broadcast address
 static const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -18,21 +19,9 @@ static const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // ESP-NOW WiFi channel — must match wristbands
 #define ESPNOW_CHANNEL 1
 
-// Serial framing state machine
-enum RxState {
-    WAIT_SYNC_0,
-    WAIT_SYNC_1,
-    READ_PAYLOAD,
-};
+// Serial framing state machine (extracted to shared/dongle_logic.h)
+static dongle_framer_t framer;
 
-static RxState rx_state = WAIT_SYNC_0;
-static uint8_t rx_buf[FIREFLY_PACKET_SIZE];
-static uint8_t rx_idx = 0;
-
-// Stats
-static uint32_t packets_forwarded = 0;
-static uint32_t crc_errors = 0;
-static uint32_t version_errors = 0;
 static uint32_t last_status_ms = 0;
 
 // Timeout: reset framing if partial packet stalls
@@ -81,6 +70,8 @@ void setup() {
         while (1) { delay(1000); }
     }
 
+    dongle_framer_init(&framer);
+
     Serial.println("ESP-NOW ready — waiting for v2 packets");
     last_byte_ms = millis();
 }
@@ -89,62 +80,18 @@ void setup() {
 
 void loop() {
     // Timeout partial frames
-    if (rx_state != WAIT_SYNC_0 && (millis() - last_byte_ms) > FRAME_TIMEOUT_MS) {
-        rx_state = WAIT_SYNC_0;
-        rx_idx = 0;
+    if (framer.rx_state != DONGLE_WAIT_SYNC_0 && (millis() - last_byte_ms) > FRAME_TIMEOUT_MS) {
+        framer.rx_state = DONGLE_WAIT_SYNC_0;
+        framer.rx_idx = 0;
     }
 
     while (Serial.available()) {
         uint8_t b = Serial.read();
         last_byte_ms = millis();
 
-        switch (rx_state) {
-            case WAIT_SYNC_0:
-                if (b == FIREFLY_SYNC_0) {
-                    rx_buf[0] = b;
-                    rx_state = WAIT_SYNC_1;
-                }
-                break;
-
-            case WAIT_SYNC_1:
-                if (b == FIREFLY_SYNC_1) {
-                    rx_buf[1] = b;
-                    rx_idx = 2;
-                    rx_state = READ_PAYLOAD;
-                } else {
-                    // False sync — check if this byte is a new SYNC_0
-                    rx_state = (b == FIREFLY_SYNC_0) ? WAIT_SYNC_1 : WAIT_SYNC_0;
-                    if (b == FIREFLY_SYNC_0) rx_buf[0] = b;
-                }
-                break;
-
-            case READ_PAYLOAD:
-                rx_buf[rx_idx++] = b;
-
-                if (rx_idx >= FIREFLY_PACKET_SIZE) {
-                    // Full packet received — validate version
-                    if (rx_buf[2] != FIREFLY_VERSION) {
-                        version_errors++;
-                        rx_state = WAIT_SYNC_0;
-                        rx_idx = 0;
-                        break;
-                    }
-
-                    // Validate CRC: over bytes [2..35)
-                    uint8_t expected_crc = firefly_crc8(&rx_buf[2], FIREFLY_PACKET_SIZE - 3);
-
-                    if (rx_buf[FIREFLY_PACKET_SIZE - 1] == expected_crc) {
-                        // Forward entire packet over ESP-NOW
-                        esp_now_send(BROADCAST_ADDR, rx_buf, FIREFLY_PACKET_SIZE);
-                        packets_forwarded++;
-                    } else {
-                        crc_errors++;
-                    }
-
-                    rx_state = WAIT_SYNC_0;
-                    rx_idx = 0;
-                }
-                break;
+        if (dongle_framer_feed(&framer, b)) {
+            // Valid packet — forward over ESP-NOW
+            esp_now_send(BROADCAST_ADDR, framer.rx_buf, FIREFLY_PACKET_SIZE);
         }
     }
 
@@ -152,6 +99,6 @@ void loop() {
     if (millis() - last_status_ms > 5000) {
         last_status_ms = millis();
         Serial.printf("fwd: %lu  crc_err: %lu  ver_err: %lu\n",
-            packets_forwarded, crc_errors, version_errors);
+            framer.packets_forwarded, framer.crc_errors, framer.version_errors);
     }
 }
