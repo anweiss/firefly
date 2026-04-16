@@ -5,8 +5,8 @@ edition = "2021"
 description = "DJ Link + Ableton Link → ESP-NOW bridge coordinator for Firefly wristbands"
 
 [dependencies]
-ableton-link-rs = { path = "../../ableton-link-rs" }
-prodjlink-rs = { path = "../../prodjlink-rs" }
+ableton-link-rs = { git = "https://github.com/anweiss/ableton-link-rs.git", branch = "main" }
+prodjlink-rs = { git = "https://github.com/anweiss/prodjlink-rs.git", branch = "main" }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 serialport = "4.7"

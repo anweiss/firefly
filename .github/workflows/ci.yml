@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+        working-directory: coordinator
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: coordinator
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: coordinator
+
+  coordinator-tests:
+    name: Coordinator tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: coordinator
+      - run: cargo test --all-features
+        working-directory: coordinator
+
+  firmware-tests:
+    name: Firmware tests (C++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run native tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I shared -o tests/test_firmware tests/test_firmware.cpp
+          ./tests/test_firmware
+
+  arduino-compile:
+    name: Arduino compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 board package
+        run: |
+          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+      - name: Compile dongle firmware
+        run: arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 dongle-firmware/
+      - name: Compile wristband firmware
+        run: arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 wristband-firmware/
