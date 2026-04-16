@@ -41,7 +41,7 @@ static uint32_t last_byte_ms = 0;
 
 // ── ESP-NOW callbacks ───────────────────────────────────────────────
 
-void on_send(const uint8_t *mac, esp_now_send_status_t status) {
+void on_send(const esp_now_send_info_t *info, esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
         Serial.println("ESP-NOW send failed");
     }
