@@ -1,10 +1,10 @@
 /**
  * Firefly Protocol v2 — Shared packet definition
  *
- * Wire format (33 bytes total, little-endian):
+ * Wire format (36 bytes total, little-endian):
  *   [0..1]   sync              0xBE 0xA7
  *   [2]      version           0x02
- *   [3]      total_len         33
+ *   [3]      total_len         36
  *   [4..11]  send_time_us      i64  coordinator clock at packet creation
  *   [12..19] next_downbeat_us  i64  coordinator clock time of next downbeat
  *   [20..21] tempo_bpm_x100    u16  BPM × 100 (e.g. 12000 = 120.00 BPM)
@@ -14,7 +14,7 @@
  *   [32]     on_air_mask       u8   bitmask: bit N = channel (N+1) on-air
  *   [33]     master_device     u8   DJ Link device number of master (0 = none)
  *   [34]     reserved          u8   reserved for future use
- *   [35]     crc8              u8   CRC-8/MAXIM over bytes [2..35)
+ *   [35]     crc8              u8   CRC-8 (poly 0x31, non-reflected) over bytes [2..35)
  *
  * Sentinels:
  *   next_beat_us = 0      → unknown / not available
@@ -52,7 +52,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  crc8;
 } firefly_packet_t;
 
-// CRC-8/MAXIM (polynomial 0x31, init 0x00, no reflect, no xor-out)
+// CRC-8 (polynomial 0x31, init 0x00, non-reflected, no xor-out)
 static inline uint8_t firefly_crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;
     for (size_t i = 0; i < len; i++) {

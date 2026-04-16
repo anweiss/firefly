@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod firmware_sim;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -7,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ableton_link_rs::link::{BasicLink, SessionState};
 use clap::Parser;
-use crc::{Crc, CRC_8_MAXIM_DOW};
+use crc::{Algorithm, Crc};
 use prodjlink_rs::{BeatEvent, ProDjLink};
 use tracing::{debug, error, info, warn};
 
@@ -17,7 +20,19 @@ const SYNC: [u8; 2] = [0xBE, 0xA7];
 const VERSION: u8 = 0x02;
 const TOTAL_LEN: u8 = 36;
 const PACKET_SIZE: usize = 36;
-const CRC8: Crc<u8> = Crc::<u8>::new(&CRC_8_MAXIM_DOW);
+// Non-reflected CRC-8 with poly 0x31 matching the firmware's firefly_crc8().
+// NOT CRC-8/MAXIM-DOW (which is reflected). Check value 0xA2 for "123456789".
+const CRC8_FIREFLY: Algorithm<u8> = Algorithm {
+    width: 8,
+    poly: 0x31,
+    init: 0x00,
+    refin: false,
+    refout: false,
+    xorout: 0x00,
+    check: 0xA2,
+    residue: 0x00,
+};
+const CRC8: Crc<u8> = Crc::<u8>::new(&CRC8_FIREFLY);
 
 // Flag bits
 const FLAG_PLAYING: u8 = 1 << 0;
@@ -136,6 +151,91 @@ fn on_air_to_mask(channels: &HashMap<u8, bool>) -> u8 {
     mask
 }
 
+// ── Beat source state machine ───────────────────────────────────────
+
+/// Extracted CDJ beat-processing state, testable without real hardware.
+struct BeatSourceState {
+    last_cdj_beat_time: Instant,
+    cdj_beat_in_bar: u8,
+    cdj_next_beat_us: i64,
+    cdj_next_bar_us: i64,
+    cdj_bpm: f64,
+    cdj_playing: bool,
+    master_device: u8,
+    channels_on_air: HashMap<u8, bool>,
+    last_beat_in_bar: u8,
+    bar_counter: u8,
+}
+
+impl BeatSourceState {
+    fn new() -> Self {
+        Self {
+            last_cdj_beat_time: Instant::now() - CDJ_TIMEOUT,
+            cdj_beat_in_bar: 0,
+            cdj_next_beat_us: 0,
+            cdj_next_bar_us: 0,
+            cdj_bpm: 0.0,
+            cdj_playing: false,
+            master_device: 0,
+            channels_on_air: HashMap::new(),
+            last_beat_in_bar: u8::MAX,
+            bar_counter: 0,
+        }
+    }
+
+    /// Update CDJ state from a master beat. The caller must filter to
+    /// master-only beats before calling this.
+    fn process_master_beat(
+        &mut self,
+        beat: &prodjlink_rs::Beat,
+        now: Instant,
+        link_clock_us: i64,
+    ) {
+        self.last_cdj_beat_time = now;
+        self.cdj_bpm = beat.effective_tempo();
+        self.cdj_beat_in_bar = if beat.beat_within_bar > 0 {
+            beat.beat_within_bar - 1
+        } else {
+            0
+        };
+        self.cdj_playing = true;
+        self.master_device = beat.device_number.0;
+
+        self.cdj_next_beat_us = beat
+            .next_beat
+            .map(|ms| link_clock_us + (ms as i64) * 1000)
+            .unwrap_or(0);
+
+        self.cdj_next_bar_us = beat
+            .next_bar
+            .map(|ms| link_clock_us + (ms as i64) * 1000)
+            .unwrap_or(0);
+    }
+
+    /// Returns `true` if CDJ timed out and state transitioned to not-playing.
+    fn check_cdj_timeout(&mut self, now: Instant) -> bool {
+        if self.cdj_playing && (now - self.last_cdj_beat_time) > CDJ_TIMEOUT {
+            self.cdj_playing = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the CDJ is currently the timing authority.
+    fn is_cdj_active(&self, now: Instant) -> bool {
+        self.cdj_playing && (now - self.last_cdj_beat_time) < CDJ_TIMEOUT
+    }
+
+    fn on_air_mask(&self) -> u8 {
+        on_air_to_mask(&self.channels_on_air)
+    }
+
+    fn update_on_air(&mut self, channels: HashMap<u8, bool>) {
+        self.channels_on_air = channels;
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -206,17 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut on_air_rx = pdl.as_ref().map(|p| p.subscribe_on_air());
 
     // Beat source state
-    let mut last_cdj_beat_time = Instant::now() - CDJ_TIMEOUT;
-    let mut cdj_beat_in_bar: u8 = 0;
-    let mut cdj_next_beat_us: i64 = 0;
-    let mut cdj_next_bar_us: i64 = 0;
-    let mut cdj_bpm: f64 = 0.0;
-    let mut cdj_playing = false;
-    let mut master_device: u8 = 0;
-    let mut channels_on_air: HashMap<u8, bool> = HashMap::new();
-
-    let mut last_beat_in_bar: u8 = u8::MAX;
-    let mut bar_counter: u8 = 0;
+    let mut state = BeatSourceState::new();
 
     info!("coordinator running — broadcasting v2 packets at {}Hz", args.rate);
 
@@ -239,38 +329,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_or(false, |d| d == beat.device_number);
 
                     if is_master {
-                        last_cdj_beat_time = Instant::now();
-                        cdj_bpm = beat.effective_tempo();
-                        // beat_within_bar is 1-based from CDJ, convert to 0-based
-                        cdj_beat_in_bar = if beat.beat_within_bar > 0 {
-                            beat.beat_within_bar - 1
-                        } else {
-                            0
-                        };
-                        cdj_playing = true;
-                        master_device = beat.device_number.0;
-
-                        // Use CDJ's own timing predictions (ms from now)
+                        let now_instant = Instant::now();
                         let now_us = link.clock().micros()
                             .num_microseconds()
                             .unwrap_or(0);
 
-                        cdj_next_beat_us = beat.next_beat
-                            .map(|ms| now_us + (ms as i64) * 1000)
-                            .unwrap_or(0);
-
-                        cdj_next_bar_us = beat.next_bar
-                            .map(|ms| now_us + (ms as i64) * 1000)
-                            .unwrap_or(0);
+                        state.process_master_beat(&beat, now_instant, now_us);
 
                         // Bridge CDJ tempo → Link
                         let link_bpm = link.capture_app_session_state().tempo();
-                        if (link_bpm - cdj_bpm).abs() > TEMPO_EPSILON {
+                        if (link_bpm - state.cdj_bpm).abs() > TEMPO_EPSILON {
                             let time = link.clock().micros();
                             let mut session = link.capture_app_session_state();
-                            session.set_tempo(cdj_bpm, time);
+                            session.set_tempo(state.cdj_bpm, time);
                             link.commit_app_session_state(session).await;
-                            debug!(cdj_bpm, "bridged CDJ tempo → Link");
+                            debug!(cdj_bpm = state.cdj_bpm, "bridged CDJ tempo → Link");
                         }
 
                         // Bridge play state → Link
@@ -288,18 +361,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(ref mut rx) = on_air_rx {
             while let Ok(on_air) = rx.try_recv() {
-                channels_on_air = on_air.channels.iter().map(|(&k, &v)| (k, v)).collect();
-                let active: Vec<u8> = channels_on_air.iter()
+                let channels: HashMap<u8, bool> = on_air.channels.iter().map(|(&k, &v)| (k, v)).collect();
+                let active: Vec<u8> = channels.iter()
                     .filter(|(_, v)| **v)
                     .map(|(&k, _)| k)
                     .collect();
+                state.update_on_air(channels);
                 debug!(on_air = ?active, "channels on-air updated");
             }
         }
 
         // ── CDJ timeout detection ──────────────────────────────────
-        if cdj_playing && last_cdj_beat_time.elapsed() > CDJ_TIMEOUT {
-            cdj_playing = false;
+        if state.check_cdj_timeout(Instant::now()) {
             info!("CDJ beat timeout — falling back to Link-only");
             let time = link.clock().micros();
             let mut session = link.capture_app_session_state();
@@ -310,11 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ── Build packet ───────────────────────────────────────────
         let now = link.clock().micros();
         let session = link.capture_app_session_state();
-        let cdj_active = cdj_playing && last_cdj_beat_time.elapsed() < CDJ_TIMEOUT;
+        let cdj_active = state.is_cdj_active(Instant::now());
 
         let (tempo, beat_in_bar, next_db_us, next_bt_us, is_playing) = if cdj_active {
             // CDJ is authoritative
-            (cdj_bpm, cdj_beat_in_bar, cdj_next_bar_us, cdj_next_beat_us, true)
+            (state.cdj_bpm, state.cdj_beat_in_bar, state.cdj_next_bar_us, state.cdj_next_beat_us, true)
         } else {
             // Link-only fallback
             let phase = session.phase_at_time(now, quantum);
@@ -330,10 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Track bar transitions
-        if beat_in_bar == 0 && last_beat_in_bar != 0 && last_beat_in_bar != u8::MAX {
-            bar_counter = bar_counter.wrapping_add(1);
+        if beat_in_bar == 0 && state.last_beat_in_bar != 0 && state.last_beat_in_bar != u8::MAX {
+            state.bar_counter = state.bar_counter.wrapping_add(1);
         }
-        last_beat_in_bar = beat_in_bar;
+        state.last_beat_in_bar = beat_in_bar;
 
         let send_time_us = now.num_microseconds().expect("coordinator clock overflow");
 
@@ -341,8 +414,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if is_playing { flags |= FLAG_PLAYING; }
         if cdj_active { flags |= FLAG_CDJ_ACTIVE; }
 
-        let on_air_mask = on_air_to_mask(&channels_on_air);
-        let master_dev = if cdj_active { master_device } else { 0 };
+        let on_air_mask = state.on_air_mask();
+        let master_dev = if cdj_active { state.master_device } else { 0 };
 
         let packet = build_packet(
             send_time_us,
@@ -360,7 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 debug!(
                     tempo = format!("{:.2}", tempo),
                     beat_in_bar,
-                    bar = bar_counter,
+                    bar = state.bar_counter,
                     cdj_active,
                     master = master_dev,
                     "sent v2 packet"
@@ -446,6 +519,22 @@ mod tests {
     }
 
     #[test]
+    fn crc8_golden_vectors() {
+        // Standard check string — must produce 0xA2 (non-reflected poly 0x31)
+        assert_eq!(CRC8.checksum(b"123456789"), 0xA2);
+        // All zeros
+        assert_eq!(CRC8.checksum(&[0u8; 10]), 0x00);
+        // Sample v2 packet payload: version(0x02) + total_len(36) + 31 zero bytes
+        let mut payload = [0u8; 33];
+        payload[0] = 0x02;
+        payload[1] = 36;
+        let crc = CRC8.checksum(&payload);
+        // Deterministic — just verify it's stable and non-trivial for non-zero input
+        assert_ne!(crc, 0x00);
+        assert_eq!(crc, CRC8.checksum(&payload)); // idempotent
+    }
+
+    #[test]
     fn on_air_mask_channels() {
         let mut channels = HashMap::new();
         channels.insert(1, true);
@@ -468,5 +557,368 @@ mod tests {
             channels.insert(ch, true);
         }
         assert_eq!(on_air_to_mask(&channels), 0b0000_1111);
+    }
+
+    // ── BeatSourceState tests ──────────────────────────────────────
+
+    use prodjlink_rs::{Bpm, DeviceNumber, DeviceType, Pitch};
+    use prodjlink_rs::protocol::beat::Beat;
+
+    fn make_test_beat(device: u8, bpm: f64, beat_within_bar: u8) -> Beat {
+        Beat {
+            name: "CDJ-TEST".to_string(),
+            device_number: DeviceNumber(device),
+            device_type: DeviceType::Cdj,
+            bpm: Bpm(bpm),
+            pitch: Pitch(0x100000), // normal speed
+            next_beat: Some(500),
+            second_beat: None,
+            next_bar: Some(2000),
+            fourth_beat: None,
+            second_bar: None,
+            eighth_beat: None,
+            beat_within_bar,
+            timestamp: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn process_master_beat_updates_all_fields() {
+        let mut state = BeatSourceState::new();
+        let beat = make_test_beat(2, 128.0, 3);
+        let now = Instant::now();
+        let link_clock_us: i64 = 1_000_000;
+
+        state.process_master_beat(&beat, now, link_clock_us);
+
+        assert_eq!(state.last_cdj_beat_time, now);
+        assert!((state.cdj_bpm - 128.0).abs() < 0.01);
+        assert_eq!(state.cdj_beat_in_bar, 2); // 3 (1-based) → 2 (0-based)
+        assert!(state.cdj_playing);
+        assert_eq!(state.master_device, 2);
+        // next_beat=500ms → link_clock + 500*1000 = 1_500_000
+        assert_eq!(state.cdj_next_beat_us, 1_500_000);
+        // next_bar=2000ms → link_clock + 2000*1000 = 3_000_000
+        assert_eq!(state.cdj_next_bar_us, 3_000_000);
+    }
+
+    #[test]
+    fn check_cdj_timeout_transitions_after_2s() {
+        let mut state = BeatSourceState::new();
+        let past = Instant::now() - Duration::from_secs(3);
+        state.cdj_playing = true;
+        state.last_cdj_beat_time = past;
+
+        assert!(state.check_cdj_timeout(Instant::now()));
+        assert!(!state.cdj_playing);
+    }
+
+    #[test]
+    fn check_cdj_timeout_no_transition_before_2s() {
+        let mut state = BeatSourceState::new();
+        state.cdj_playing = true;
+        state.last_cdj_beat_time = Instant::now();
+
+        assert!(!state.check_cdj_timeout(Instant::now()));
+        assert!(state.cdj_playing);
+    }
+
+    #[test]
+    fn is_cdj_active_reflects_timeout() {
+        let mut state = BeatSourceState::new();
+        let now = Instant::now();
+
+        // Not playing → not active
+        assert!(!state.is_cdj_active(now));
+
+        // Playing with recent beat → active
+        state.cdj_playing = true;
+        state.last_cdj_beat_time = now;
+        assert!(state.is_cdj_active(now));
+
+        // Playing but beat too old → not active
+        state.last_cdj_beat_time = now - Duration::from_secs(3);
+        assert!(!state.is_cdj_active(now));
+    }
+
+    #[test]
+    fn on_air_mask_via_state() {
+        let mut state = BeatSourceState::new();
+        let mut channels = HashMap::new();
+        channels.insert(1, true);
+        channels.insert(2, false);
+        channels.insert(4, true);
+        state.update_on_air(channels);
+
+        assert_eq!(state.on_air_mask(), 0b0000_1001); // ch1 + ch4
+    }
+
+    // ── End-to-end integration tests ───────────────────────────────
+    //
+    // These exercise the full pipeline: CDJ Beat → BeatSourceState →
+    // build_packet → DongleSim (framing + CRC) → WristbandSim (parse
+    // + clock offset + flash scheduling). No real hardware required.
+
+    use crate::firmware_sim::{DongleSim, WristbandSim};
+
+    /// Helper: process a beat through the full pipeline and return the
+    /// wristband's state after receiving the packet.
+    fn pipeline(
+        beat: &Beat,
+        on_air: Option<HashMap<u8, bool>>,
+    ) -> (BeatSourceState, [u8; PACKET_SIZE], WristbandSim) {
+        let mut state = BeatSourceState::new();
+        let now = Instant::now();
+        let link_clock_us: i64 = 10_000_000; // 10s into the session
+
+        state.process_master_beat(beat, now, link_clock_us);
+        if let Some(channels) = on_air {
+            state.update_on_air(channels);
+        }
+
+        let cdj_active = state.is_cdj_active(now);
+        let mut flags: u8 = 0;
+        if cdj_active { flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE; }
+
+        let packet = build_packet(
+            link_clock_us,
+            state.cdj_next_bar_us,
+            (state.cdj_bpm * 100.0) as u16,
+            state.cdj_beat_in_bar,
+            flags,
+            state.cdj_next_beat_us,
+            state.on_air_mask(),
+            if cdj_active { state.master_device } else { 0 },
+        );
+
+        // Dongle: validate framing + CRC
+        let mut dongle = DongleSim::new();
+        let forwarded = dongle.feed_bytes(&packet);
+        assert_eq!(forwarded.len(), 1, "dongle must forward the packet");
+        assert_eq!(dongle.crc_errors, 0, "coordinator CRC must match firmware CRC");
+        assert_eq!(dongle.version_errors, 0);
+
+        // Wristband: parse + clock offset
+        let mut wristband = WristbandSim::new();
+        // Simulate wristband local clock = coordinator clock - 5ms transport delay
+        let wb_local_now = link_clock_us - 5_000;
+        wristband.receive_packet(&forwarded[0], wb_local_now);
+
+        (state, packet, wristband)
+    }
+
+    #[test]
+    fn e2e_cdj_beat_flows_to_wristband() {
+        let beat = make_test_beat(1, 126.3, 1); // CDJ-3000 P1 at 126.3 BPM, beat 1
+        let (state, _pkt, wb) = pipeline(&beat, None);
+
+        // Coordinator state
+        assert!(state.cdj_playing);
+        assert_eq!(state.master_device, 1);
+        assert!((state.cdj_bpm - 126.3).abs() < 0.01);
+
+        // Wristband received the packet
+        assert_eq!(wb.packets_received, 1);
+        assert!(wb.is_playing());
+        assert!(wb.is_cdj_active());
+        assert_eq!(wb.master_device, 1);
+        assert_eq!(wb.tempo_x100, 12630);
+        assert_eq!(wb.beat_in_bar, 0); // 1 (1-based) → 0 (0-based)
+    }
+
+    #[test]
+    fn e2e_downbeat_detection() {
+        // beat_within_bar=1 is the downbeat (1-based from CDJ)
+        let beat = make_test_beat(2, 128.0, 1);
+        let (_state, _pkt, wb) = pipeline(&beat, None);
+
+        assert_eq!(wb.beat_in_bar, 0); // 0-based downbeat
+        assert!(wb.is_next_downbeat());
+    }
+
+    #[test]
+    fn e2e_non_downbeat() {
+        let beat = make_test_beat(2, 128.0, 3);
+        let (_state, _pkt, wb) = pipeline(&beat, None);
+
+        assert_eq!(wb.beat_in_bar, 2); // 3 (1-based) → 2 (0-based)
+        // beat_in_bar != 0 and next_beat_us != next_downbeat_us
+        assert!(!wb.is_next_downbeat() || wb.next_beat_us == wb.next_downbeat_us);
+    }
+
+    #[test]
+    fn e2e_on_air_mask_propagated() {
+        let beat = make_test_beat(1, 120.0, 1);
+        let mut channels = HashMap::new();
+        channels.insert(1, true); // ch1 on-air
+        channels.insert(2, true); // ch2 on-air
+        channels.insert(3, false);
+        channels.insert(4, false);
+
+        let (_state, _pkt, wb) = pipeline(&beat, Some(channels));
+
+        assert_eq!(wb.on_air_mask, 0b0000_0011); // ch1 + ch2
+    }
+
+    #[test]
+    fn e2e_master_device_propagated() {
+        let beat = make_test_beat(3, 140.0, 2); // device 3 is master
+        let (_state, _pkt, wb) = pipeline(&beat, None);
+
+        assert_eq!(wb.master_device, 3);
+    }
+
+    #[test]
+    fn e2e_next_beat_timing_propagated() {
+        let beat = make_test_beat(1, 126.0, 2);
+        let (_state, _pkt, wb) = pipeline(&beat, None);
+
+        // CDJ says next_beat=500ms from now → link_clock(10_000_000) + 500*1000
+        assert_eq!(wb.next_beat_us, 10_500_000);
+        // CDJ says next_bar=2000ms from now → link_clock(10_000_000) + 2000*1000
+        assert_eq!(wb.next_downbeat_us, 12_000_000);
+    }
+
+    #[test]
+    fn e2e_wristband_schedules_flash() {
+        let beat = make_test_beat(1, 128.0, 2);
+        let (_state, _pkt, wb) = pipeline(&beat, None);
+
+        let flash = wb.next_flash_local_us().expect("should schedule a flash");
+        // Flash should be in the future relative to wristband's local clock
+        // wb_local_now was 10_000_000 - 5_000 = 9_995_000
+        // next_beat_us is 10_500_000, clock_offset = 10_000_000 - 9_995_000 = 5000
+        // local flash = 10_500_000 - 5000 = 10_495_000
+        assert!(flash > 9_995_000, "flash should be in the future");
+    }
+
+    #[test]
+    fn e2e_cdj_timeout_clears_cdj_active() {
+        let beat = make_test_beat(1, 126.0, 1);
+        let mut state = BeatSourceState::new();
+        let past = Instant::now() - Duration::from_secs(3);
+
+        state.process_master_beat(&beat, past, 10_000_000);
+
+        // 3 seconds later: CDJ should have timed out
+        let now = Instant::now();
+        assert!(state.check_cdj_timeout(now));
+        assert!(!state.cdj_playing);
+        assert!(!state.is_cdj_active(now));
+
+        // Build a Link-only packet (no CDJ data)
+        let flags: u8 = 0; // not playing, not cdj_active
+        let packet = build_packet(10_000_000, 0, 12000, 0, flags, 0, 0, 0);
+
+        let mut dongle = DongleSim::new();
+        let forwarded = dongle.feed_bytes(&packet);
+        assert_eq!(forwarded.len(), 1);
+
+        let mut wb = WristbandSim::new();
+        wb.receive_packet(&forwarded[0], 9_995_000);
+
+        assert!(!wb.is_playing());
+        assert!(!wb.is_cdj_active());
+        assert_eq!(wb.master_device, 0);
+    }
+
+    #[test]
+    fn e2e_multi_beat_sequence() {
+        // Simulate 4 beats (one full bar) flowing through the pipeline
+        let mut state = BeatSourceState::new();
+        let mut dongle = DongleSim::new();
+        let mut wristband = WristbandSim::new();
+        let base_time = Instant::now();
+        let beat_interval_ms: u64 = 469; // ~128 BPM
+
+        for i in 0..4u8 {
+            let beat_within_bar = i + 1; // 1-based
+            let beat = make_test_beat(1, 128.0, beat_within_bar);
+            let now = base_time + Duration::from_millis(i as u64 * beat_interval_ms);
+            let link_us = 10_000_000 + (i as i64) * (beat_interval_ms as i64) * 1000;
+
+            state.process_master_beat(&beat, now, link_us);
+
+            let cdj_active = state.is_cdj_active(now);
+            let mut flags: u8 = 0;
+            if cdj_active { flags |= FLAG_PLAYING | FLAG_CDJ_ACTIVE; }
+
+            let packet = build_packet(
+                link_us,
+                state.cdj_next_bar_us,
+                (state.cdj_bpm * 100.0) as u16,
+                state.cdj_beat_in_bar,
+                flags,
+                state.cdj_next_beat_us,
+                0, 0,
+            );
+
+            let forwarded = dongle.feed_bytes(&packet);
+            assert_eq!(forwarded.len(), 1, "beat {} must forward", i);
+
+            let wb_local = link_us - 5_000;
+            wristband.receive_packet(&forwarded[0], wb_local);
+
+            assert_eq!(wristband.beat_in_bar, i); // 0-based
+            assert!(wristband.is_playing());
+            assert!(wristband.is_cdj_active());
+        }
+
+        assert_eq!(dongle.packets_forwarded, 4);
+        assert_eq!(wristband.packets_received, 4);
+        assert!(wristband.offset_initialized);
+    }
+
+    #[test]
+    fn e2e_dongle_rejects_corrupted_then_accepts_good() {
+        let beat = make_test_beat(1, 120.0, 1);
+        let mut state = BeatSourceState::new();
+        let now = Instant::now();
+        state.process_master_beat(&beat, now, 10_000_000);
+
+        let packet = build_packet(
+            10_000_000, state.cdj_next_bar_us,
+            12000, 0, FLAG_PLAYING | FLAG_CDJ_ACTIVE,
+            state.cdj_next_beat_us, 0, 1,
+        );
+
+        // Corrupt the first packet
+        let mut bad = packet;
+        bad[20] ^= 0xFF; // corrupt tempo field
+
+        let mut dongle = DongleSim::new();
+
+        // Feed corrupted packet — should be rejected (CRC mismatch)
+        let results = dongle.feed_bytes(&bad);
+        assert!(results.is_empty());
+        assert_eq!(dongle.crc_errors, 1);
+
+        // Feed good packet — should pass
+        let results = dongle.feed_bytes(&packet);
+        assert_eq!(results.len(), 1);
+        assert_eq!(dongle.packets_forwarded, 1);
+    }
+
+    #[test]
+    fn e2e_crc_cross_validation() {
+        // Verify that the coordinator's CRC (crc crate with custom algo)
+        // matches the firmware's CRC (manual bit-banging) for a real packet.
+        let packet = build_packet(
+            99_999_999, 199_999_999, 12630, 2,
+            FLAG_PLAYING | FLAG_CDJ_ACTIVE,
+            149_999_999, 0b0000_0101, 3,
+        );
+
+        // Coordinator CRC
+        let coord_crc = packet[35];
+
+        // Firmware CRC (via DongleSim which uses the manual implementation)
+        let mut dongle = DongleSim::new();
+        let forwarded = dongle.feed_bytes(&packet);
+        assert_eq!(forwarded.len(), 1, "CRC must match — coordinator and firmware agree");
+        assert_eq!(dongle.crc_errors, 0, "zero CRC errors confirms cross-compatibility");
+
+        // Also verify the CRC byte is non-trivial
+        assert_ne!(coord_crc, 0x00, "CRC should be non-trivial for this payload");
     }
 }
