@@ -12,6 +12,7 @@
 #include <esp_wifi.h>
 #include "../shared/protocol.h"
 #include "../shared/dongle_logic.h"
+#include "../shared/oled_display.h"
 
 // ESP-NOW broadcast address
 static const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -24,6 +25,14 @@ static const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static dongle_framer_t framer;
 
 static uint32_t last_status_ms = 0;
+static uint32_t last_oled_ms   = 0;
+
+// Latest BPM from most recently forwarded packet (parsed after frame success)
+static uint16_t latest_tempo_x100 = 0;
+static uint8_t  latest_beat_in_bar = 0;
+static uint32_t last_fwd_seen = 0;
+
+static oled_display_t oled;
 
 // Timeout: reset framing if partial packet stalls
 static uint32_t last_byte_ms = 0;
@@ -80,7 +89,18 @@ void setup() {
 
     dongle_framer_init(&framer);
 
+    // OLED on expansion board (optional — continues if not present)
+    bool oled_ok = firefly_oled_begin(&oled);
+    if (oled_ok) {
+        firefly_oled_clear(&oled);
+        firefly_oled_header(&oled, "Firefly DNG");
+        firefly_oled_kv(&oled, 0, "ch", String(ESPNOW_CHANNEL).c_str());
+        firefly_oled_kv(&oled, 1, "st", "waiting");
+        firefly_oled_flush(&oled);
+    }
+
     Serial.println("ESP-NOW ready — waiting for v2 packets");
+    Serial.printf("OLED: %s\n", oled_ok ? "ok" : "absent");
 
     // Diagnostic: print MAC and channel
     uint8_t mac[6];
@@ -109,6 +129,45 @@ void loop() {
         if (dongle_framer_feed(&framer, b)) {
             // Valid packet — forward over ESP-NOW
             esp_now_send(BROADCAST_ADDR, framer.rx_buf, FIREFLY_PACKET_SIZE);
+
+            // Peek at tempo + beat_in_bar for OLED display
+            memcpy(&latest_tempo_x100, &framer.rx_buf[20], sizeof(uint16_t));
+            latest_beat_in_bar = framer.rx_buf[22];
+            last_fwd_seen = millis();
+        }
+    }
+
+    // Refresh OLED ~5Hz — cheap enough on C3, avoids starving WiFi
+    if (millis() - last_oled_ms > 200) {
+        last_oled_ms = millis();
+        if (oled.present) {
+            char line[24];
+            firefly_oled_clear(&oled);
+            firefly_oled_header(&oled, "Firefly DNG");
+
+            float bpm = latest_tempo_x100 / 100.0f;
+            bool live = (millis() - last_fwd_seen) < 1000 && last_fwd_seen != 0;
+            snprintf(line, sizeof(line), "%5.1f %s beat %u",
+                     bpm, live ? "LIVE" : "idle ",
+                     (unsigned)(latest_beat_in_bar + 1));
+            firefly_oled_kv(&oled, 0, "bpm", line);
+
+            snprintf(line, sizeof(line), "%lu", (unsigned long)framer.packets_forwarded);
+            firefly_oled_kv(&oled, 1, "fwd", line);
+
+            snprintf(line, sizeof(line), "%lu/%lu",
+                     (unsigned long)send_ok, (unsigned long)send_fail);
+            firefly_oled_kv(&oled, 2, "tx ", line);
+
+            uint8_t pri; wifi_second_chan_t sec;
+            esp_wifi_get_channel(&pri, &sec);
+            snprintf(line, sizeof(line), "%u  err c:%lu v:%lu",
+                     pri,
+                     (unsigned long)framer.crc_errors,
+                     (unsigned long)framer.version_errors);
+            firefly_oled_kv(&oled, 3, "ch ", line);
+
+            firefly_oled_flush(&oled);
         }
     }
 
