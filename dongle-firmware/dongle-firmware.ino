@@ -137,8 +137,8 @@ void loop() {
         }
     }
 
-    // Refresh OLED ~5Hz — cheap enough on C3, avoids starving WiFi
-    if (millis() - last_oled_ms > 200) {
+    // Refresh OLED ~2Hz — minimize time spent blocking in I2C transfer
+    if (millis() - last_oled_ms > 500) {
         last_oled_ms = millis();
         if (oled.present) {
             char line[24];

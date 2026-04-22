@@ -14,6 +14,7 @@
 #include <esp_timer.h>
 #include <FastLED.h>
 #include "../shared/protocol.h"
+#include "../shared/oled_display.h"
 
 // ── Hardware config ─────────────────────────────────────────────────
 
@@ -60,6 +61,11 @@ static volatile uint32_t last_packet_local_us = 0;
 // ── LED state ───────────────────────────────────────────────────────
 
 static CRGB leds[NUM_LEDS];
+
+// ── OLED state ──────────────────────────────────────────────────────
+
+static oled_display_t oled;
+static uint32_t last_oled_ms = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -133,24 +139,60 @@ void IRAM_ATTR on_receive(const esp_now_recv_info_t *info, const uint8_t *data, 
     packets_received++;
 }
 
-// ── LED animation ───────────────────────────────────────────────────
+// ── LED animation (non-blocking) ────────────────────────────────────
+//
+// Previous implementation did delay(80) + fade_out() with delay(8) per
+// step = ~160ms of blocking time per beat with FastLED IRQ-disabled
+// sections — starved ESP-NOW RX on single-core C3 causing periodic
+// freezes. Refactored to a state machine driven by millis().
 
-void flash_leds(CRGB color) {
+#define FADE_DURATION_MS  80      // fade-out wall clock time
+#define LED_MIN_SHOW_MS   12      // throttle FastLED.show() during fade
+
+static enum { FLASH_IDLE, FLASH_ON, FLASH_FADING } flash_state = FLASH_IDLE;
+static uint32_t flash_start_ms = 0;
+static uint32_t last_led_show_ms = 0;
+static CRGB     flash_color = CRGB::Black;
+
+static inline void flash_leds(CRGB color) {
     fill_solid(leds, NUM_LEDS, color);
     FastLED.show();
+    last_led_show_ms = millis();
 }
 
-void fade_out() {
-    for (int step = FADE_STEPS; step > 0; step--) {
-        uint8_t scale = (uint8_t)(255 * step / FADE_STEPS);
-        for (int i = 0; i < NUM_LEDS; i++) {
-            leds[i].nscale8(scale);
+// Advance the flash state machine. Call every loop iteration.
+static void flash_tick() {
+    if (flash_state == FLASH_IDLE) return;
+
+    uint32_t elapsed = millis() - flash_start_ms;
+
+    if (flash_state == FLASH_ON) {
+        if (elapsed >= FLASH_DURATION_MS) {
+            flash_state = FLASH_FADING;
         }
-        FastLED.show();
-        delay(FLASH_DURATION_MS / FADE_STEPS);
+        return;
     }
-    fill_solid(leds, NUM_LEDS, COLOR_OFF);
+
+    // FLASH_FADING
+    uint32_t fade_elapsed = elapsed - FLASH_DURATION_MS;
+    if (fade_elapsed >= FADE_DURATION_MS) {
+        fill_solid(leds, NUM_LEDS, COLOR_OFF);
+        FastLED.show();
+        last_led_show_ms = millis();
+        flash_state = FLASH_IDLE;
+        return;
+    }
+
+    // Throttle show() calls to avoid excessive bit-banging
+    if (millis() - last_led_show_ms < LED_MIN_SHOW_MS) return;
+
+    uint8_t scale = (uint8_t)(255 - (255 * fade_elapsed / FADE_DURATION_MS));
+    for (int i = 0; i < NUM_LEDS; i++) {
+        leds[i] = flash_color;
+        leds[i].nscale8(scale);
+    }
     FastLED.show();
+    last_led_show_ms = millis();
 }
 
 // ── Setup ───────────────────────────────────────────────────────────
@@ -210,6 +252,17 @@ void setup() {
     esp_wifi_get_channel(&primary, &second);
     Serial.printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X  channel: %d\n",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], primary);
+
+    // OLED on expansion board (optional)
+    bool oled_ok = firefly_oled_begin(&oled);
+    if (oled_ok) {
+        firefly_oled_clear(&oled);
+        firefly_oled_header(&oled, "Firefly WB");
+        firefly_oled_kv(&oled, 0, "ch ", String(ESPNOW_CHANNEL).c_str());
+        firefly_oled_kv(&oled, 1, "st ", "waiting");
+        firefly_oled_flush(&oled);
+    }
+    Serial.printf("OLED: %s\n", oled_ok ? "ok" : "absent");
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
@@ -267,26 +320,62 @@ void loop() {
                 color = COLOR_BEAT;
             }
 
+            flash_color = color;
+            flash_start_ms = millis();
+            flash_state = FLASH_ON;
             flash_leds(color);
-            delay(FLASH_DURATION_MS);
-            fade_out();
 
             waiting_for_beat = false;
             scheduled_flash_local_us = 0;
         }
     }
 
+    // Advance LED fade state machine (non-blocking)
+    flash_tick();
+
     // ── Idle indicator ──────────────────────────────────────────────
-    // Dim pulse if no packets for >3 seconds — throttled to 30ms to avoid
-    // starving WiFi RX on single-core ESP32-C3
+    // Dim pulse if no packets for >3 seconds. Skip while a flash is
+    // animating to avoid stomping on the beat color.
     static uint32_t last_idle_ms = 0;
-    if ((packets_received == 0 ||
+    if (flash_state == FLASH_IDLE &&
+        (packets_received == 0 ||
         (millis() - (last_packet_local_us / 1000)) > 3000) &&
-        (millis() - last_idle_ms) >= 30) {
+        (millis() - last_idle_ms) >= 100) {
         last_idle_ms = millis();
         uint8_t brightness = (uint8_t)(20 + 10 * sin(millis() / 500.0));
         fill_solid(leds, NUM_LEDS, CRGB(0, 0, brightness));
         FastLED.show();
+    }
+
+    // ── OLED refresh ~2Hz ────────────────────────────────────────────
+    // Kept at 2Hz (500ms) to minimize time spent blocking in I2C transfer.
+    if (oled.present && millis() - last_oled_ms > 500) {
+        last_oled_ms = millis();
+        char line[24];
+        firefly_oled_clear(&oled);
+        firefly_oled_header(&oled, "Firefly WB");
+
+        float tempo = latest_tempo_x100 / 100.0f;
+        bool is_playing = (latest_flags & FIREFLY_FLAG_PLAYING) != 0;
+        bool cdj_active = (latest_flags & FIREFLY_FLAG_CDJ_ACTIVE) != 0;
+        const char *src = cdj_active ? "CDJ " : (is_playing ? "LINK" : "idle");
+        snprintf(line, sizeof(line), "%5.1f %s b%u", tempo, src,
+                 (unsigned)(latest_beat_in_bar + 1));
+        firefly_oled_kv(&oled, 0, "bpm", line);
+
+        snprintf(line, sizeof(line), "%lu", (unsigned long)packets_received);
+        firefly_oled_kv(&oled, 1, "rx ", line);
+
+        // Offset in ms for readability
+        long off_ms = (long)(clock_offset_us / 1000);
+        snprintf(line, sizeof(line), "%ld ms", off_ms);
+        firefly_oled_kv(&oled, 2, "off", line);
+
+        snprintf(line, sizeof(line), "m:%u air:%02X",
+                 latest_master_device, latest_on_air_mask);
+        firefly_oled_kv(&oled, 3, "mt ", line);
+
+        firefly_oled_flush(&oled);
     }
 
     // ── Periodic status (serial debug) ──────────────────────────────
