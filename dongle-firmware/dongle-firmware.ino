@@ -147,8 +147,9 @@ void loop() {
 
             float bpm = latest_tempo_x100 / 100.0f;
             bool live = (millis() - last_fwd_seen) < 1000 && last_fwd_seen != 0;
-            snprintf(line, sizeof(line), "%5.1f %s beat %u",
-                     bpm, live ? "LIVE" : "idle ",
+            // Keep under 128px (21 chars @ 6px default font)
+            snprintf(line, sizeof(line), "%5.1f %s b%u",
+                     bpm, live ? "LIVE" : "idle",
                      (unsigned)(latest_beat_in_bar + 1));
             firefly_oled_kv(&oled, 0, "bpm", line);
 
@@ -161,7 +162,7 @@ void loop() {
 
             uint8_t pri; wifi_second_chan_t sec;
             esp_wifi_get_channel(&pri, &sec);
-            snprintf(line, sizeof(line), "%u  err c:%lu v:%lu",
+            snprintf(line, sizeof(line), "%u err c:%lu v:%lu",
                      pri,
                      (unsigned long)framer.crc_errors,
                      (unsigned long)framer.version_errors);

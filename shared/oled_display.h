@@ -35,6 +35,7 @@ static inline bool firefly_oled_begin(oled_display_t *o) {
     o->dev->clearDisplay();
     o->dev->setTextColor(SSD1306_WHITE);
     o->dev->setTextSize(1);
+    o->dev->setTextWrap(false);
     o->dev->setCursor(0, 0);
     o->dev->display();
     return true;
