@@ -23,8 +23,9 @@
 #define COLOR_ORDER   GRB
 #define MAX_BRIGHTNESS 50         // 20-30% of 255 for battery life
 
-// ESP-NOW channel — must match dongle
-#define ESPNOW_CHANNEL 1
+// ESP-NOW channel — must match dongle.
+// Ch 11 chosen to avoid congestion from common APs on ch 1/6.
+#define ESPNOW_CHANNEL 11
 
 // ── LED colors ──────────────────────────────────────────────────────
 
@@ -73,7 +74,11 @@ static int64_t to_local_time(int64_t coordinator_us) {
 
 // ── ESP-NOW receive callback (runs in WiFi task context) ────────────
 
+// Track ALL frames arriving (any length) — separate from packets_received which filters
+static volatile uint32_t any_frames = 0;
+
 void IRAM_ATTR on_receive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    any_frames++;
     if (len != FIREFLY_PACKET_SIZE) return;
 
     // Validate sync bytes
@@ -170,18 +175,41 @@ void setup() {
     // Init WiFi for ESP-NOW (no association)
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    WiFi.setSleep(false);
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_err_t ch_err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
     // Init ESP-NOW
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("ESP-NOW init FAILED");
+    esp_err_t now_err = esp_now_init();
+    if (now_err != ESP_OK) {
+        Serial.printf("ESP-NOW init FAILED: %d\n", now_err);
         flash_leds(CRGB::Red);
         while (1) { delay(1000); }
     }
 
     esp_now_register_recv_cb(on_receive);
 
+    // Register broadcast peer (needed for RX on ESP32-C3 in some Arduino core versions)
+    const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, BROADCAST_ADDR, 6);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.encrypt = false;
+    esp_err_t peer_err = esp_now_add_peer(&peer);
+
     Serial.println("ESP-NOW ready — waiting for beats");
+    Serial.printf("init codes: ps=%d ch=%d now=%d peer=%d\n",
+        ps_err, ch_err, now_err, peer_err);
+
+    // Diagnostic: print MAC and channel
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    uint8_t primary; wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary, &second);
+    Serial.printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X  channel: %d\n",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], primary);
 }
 
 // ── Main loop ───────────────────────────────────────────────────────
@@ -249,9 +277,13 @@ void loop() {
     }
 
     // ── Idle indicator ──────────────────────────────────────────────
-    // Dim pulse if no packets for >3 seconds
-    if (packets_received == 0 ||
-        (millis() - (last_packet_local_us / 1000)) > 3000) {
+    // Dim pulse if no packets for >3 seconds — throttled to 30ms to avoid
+    // starving WiFi RX on single-core ESP32-C3
+    static uint32_t last_idle_ms = 0;
+    if ((packets_received == 0 ||
+        (millis() - (last_packet_local_us / 1000)) > 3000) &&
+        (millis() - last_idle_ms) >= 30) {
+        last_idle_ms = millis();
         uint8_t brightness = (uint8_t)(20 + 10 * sin(millis() / 500.0));
         fill_solid(leds, NUM_LEDS, CRGB(0, 0, brightness));
         FastLED.show();
@@ -263,9 +295,10 @@ void loop() {
         float tempo = latest_tempo_x100 / 100.0f;
         bool cdj_active = (latest_flags & FIREFLY_FLAG_CDJ_ACTIVE) != 0;
         Serial.printf(
-            "pkts: %lu  offset: %lld us  tempo: %.1f  beat: %d  "
+            "pkts: %lu  any: %lu  offset: %lld us  tempo: %.1f  beat: %d  "
             "playing: %s  cdj: %s  master: %d  air: 0x%02X\n",
             packets_received,
+            any_frames,
             clock_offset_us,
             tempo,
             latest_beat_in_bar,

@@ -16,8 +16,9 @@
 // ESP-NOW broadcast address
 static const uint8_t BROADCAST_ADDR[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// ESP-NOW WiFi channel — must match wristbands
-#define ESPNOW_CHANNEL 1
+// ESP-NOW WiFi channel — must match wristbands.
+// Ch 11 chosen to avoid congestion from common APs on ch 1/6.
+#define ESPNOW_CHANNEL 11
 
 // Serial framing state machine (extracted to shared/dongle_logic.h)
 static dongle_framer_t framer;
@@ -30,9 +31,14 @@ static uint32_t last_byte_ms = 0;
 
 // ── ESP-NOW callbacks ───────────────────────────────────────────────
 
+static uint32_t send_ok = 0;
+static uint32_t send_fail = 0;
+
 void on_send(const esp_now_send_info_t *info, esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
-        Serial.println("ESP-NOW send failed");
+        send_fail++;
+    } else {
+        send_ok++;
     }
 }
 
@@ -47,6 +53,7 @@ void setup() {
     // Init WiFi in station mode (no association — ESP-NOW only)
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    delay(100);
 
     // Lock to a fixed channel
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -64,6 +71,7 @@ void setup() {
     memcpy(peer.peer_addr, BROADCAST_ADDR, 6);
     peer.channel = ESPNOW_CHANNEL;
     peer.encrypt = false;
+    peer.ifidx = WIFI_IF_STA;
 
     if (esp_now_add_peer(&peer) != ESP_OK) {
         Serial.println("Failed to add broadcast peer");
@@ -73,6 +81,15 @@ void setup() {
     dongle_framer_init(&framer);
 
     Serial.println("ESP-NOW ready — waiting for v2 packets");
+
+    // Diagnostic: print MAC and channel
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    uint8_t primary; wifi_second_chan_t second;
+    esp_wifi_get_channel(&primary, &second);
+    Serial.printf("MAC: %02X:%02X:%02X:%02X:%02X:%02X  channel: %d\n",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], primary);
+
     last_byte_ms = millis();
 }
 
@@ -98,7 +115,9 @@ void loop() {
     // Periodic status (every 5 seconds)
     if (millis() - last_status_ms > 5000) {
         last_status_ms = millis();
-        Serial.printf("fwd: %lu  crc_err: %lu  ver_err: %lu\n",
-            framer.packets_forwarded, framer.crc_errors, framer.version_errors);
+        uint8_t pri; wifi_second_chan_t sec;
+        esp_wifi_get_channel(&pri, &sec);
+        Serial.printf("fwd: %lu  send_ok: %lu  send_fail: %lu  crc_err: %lu  ver_err: %lu  ch: %d\n",
+            framer.packets_forwarded, send_ok, send_fail, framer.crc_errors, framer.version_errors, pri);
     }
 }
