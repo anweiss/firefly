@@ -44,6 +44,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ESP-IDF host build dependencies
         run: |
+          # Drop third-party apt sources that often have transient sync issues
+          # on GitHub-hosted runners (e.g. dl.google.com chrome-stable). We
+          # don't need them for this build.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list
           sudo apt-get update
           sudo apt-get install -y \
             git wget flex bison gperf python3 python3-pip python3-venv \
@@ -75,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        run: sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list && sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -91,7 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        run: sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list && sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
