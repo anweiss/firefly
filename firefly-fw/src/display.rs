@@ -14,7 +14,7 @@
 //! at most every 250 ms (matches the dongle's `ulTaskNotifyTake` cadence).
 
 use anyhow::Result;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -22,7 +22,11 @@ use embedded_graphics::{
     primitives::{PrimitiveStyleBuilder, Rectangle},
     text::{Baseline, Text},
 };
-use esp_idf_svc::hal::gpio::AnyIOPin;
+use esp_idf_svc::hal::adc::attenuation::DB_12;
+use esp_idf_svc::hal::adc::oneshot::config::{AdcChannelConfig, Calibration};
+use esp_idf_svc::hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
+use esp_idf_svc::hal::adc::ADC1;
+use esp_idf_svc::hal::gpio::{AnyIOPin, Gpio4};
 use esp_idf_svc::hal::i2c::{config::Config as I2cConfig, I2cDriver, I2C0};
 use esp_idf_svc::hal::units::FromValueType;
 use log::{info, warn};
@@ -47,14 +51,31 @@ pub struct LiveState {
     /// Set when the display thread should redraw immediately (e.g. on
     /// beat-edge from the main loop).
     pub kick: AtomicBool,
+    /// Smoothed battery voltage (mV) at the cell, after dividing.
+    /// 0 = uninitialised.
+    pub vbat_mv: AtomicI32,
+    /// Battery percentage (0..=100) or -1 if no divider wired.
+    pub vbat_percent: AtomicI8,
 }
 
 const OLED_ADDR: u8 = 0x3C;
+
+/// 100k:100k voltage divider from BAT to GPIO4 (A2 / D2 on the XIAO
+/// expansion board). See `shared/battery_sense.h` for wiring.
+const VBAT_DIVIDER_NUM: i32 = 2;
+const VBAT_DIVIDER_DEN: i32 = 1;
+
+/// Plausibility window — readings outside this range are treated as
+/// "no divider wired" and the display shows "--".
+const VBAT_MIN_MV: i32 = 2500;
+const VBAT_MAX_MV: i32 = 4400;
 
 pub fn spawn(
     i2c: I2C0<'static>,
     sda: AnyIOPin<'static>,
     scl: AnyIOPin<'static>,
+    adc1: ADC1<'static>,
+    vbat_pin: Gpio4<'static>,
     state: Arc<LiveState>,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -62,7 +83,7 @@ pub fn spawn(
         .name("oled".into())
         .stack_size(8192)
         .spawn(move || {
-            if let Err(e) = run(i2c, sda, scl, state, stats) {
+            if let Err(e) = run(i2c, sda, scl, adc1, vbat_pin, state, stats) {
                 warn!("OLED task exited: {:?}", e);
             }
         })?;
@@ -73,6 +94,8 @@ fn run(
     i2c: I2C0<'static>,
     sda: AnyIOPin<'static>,
     scl: AnyIOPin<'static>,
+    adc1: ADC1<'static>,
+    vbat_pin: Gpio4<'static>,
     state: Arc<LiveState>,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -99,6 +122,22 @@ fn run(
     }
     info!("OLED: SSD1306 ready @ 0x{:02X}", OLED_ADDR);
 
+    // ADC oneshot driver for battery sense. If it fails to initialise
+    // (e.g. ADC peripheral already taken) we fall back to "no battery"
+    // mode rather than aborting the whole display task.
+    let adc = AdcDriver::new(adc1).ok();
+    let mut chan = adc.as_ref().and_then(|a| {
+        let cfg = AdcChannelConfig {
+            attenuation: DB_12,
+            calibration: Calibration::Curve,
+            ..Default::default()
+        };
+        AdcChannelDriver::new(a, vbat_pin, &cfg).ok()
+    });
+    if chan.is_none() {
+        warn!("OLED: ADC init failed; battery row will show '--'");
+    }
+
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
@@ -116,6 +155,23 @@ fn run(
     };
 
     loop {
+        // Sample battery on every refresh tick (cheap, <100 µs).
+        if let (Some(adc), Some(chan)) = (adc.as_ref(), chan.as_mut()) {
+            if let Ok(adc_mv) = adc.read(chan) {
+                let bat_mv = adc_mv as i32 * VBAT_DIVIDER_NUM / VBAT_DIVIDER_DEN;
+                let prev = state.vbat_mv.load(Ordering::Relaxed);
+                let smoothed = if prev == 0 {
+                    bat_mv
+                } else {
+                    (prev * 7 + bat_mv) / 8
+                };
+                state.vbat_mv.store(smoothed, Ordering::Relaxed);
+                state
+                    .vbat_percent
+                    .store(lipo_percent(smoothed), Ordering::Relaxed);
+            }
+        }
+
         let _ = redraw(
             &mut disp,
             &text_style,
@@ -137,6 +193,44 @@ fn run(
             waited += step;
         }
     }
+}
+
+/// Piecewise-linear LiPo voltage→percent mapping. Mirrors
+/// `firefly_battery_percent` in `shared/battery_sense.h`. Returns -1
+/// when the voltage is outside the plausible 1S LiPo window (likely
+/// the divider isn't wired and the ADC is floating).
+fn lipo_percent(vbat_mv: i32) -> i8 {
+    if !(VBAT_MIN_MV..=VBAT_MAX_MV).contains(&vbat_mv) {
+        return -1;
+    }
+    const CURVE: &[(i32, i8)] = &[
+        (3300, 0),
+        (3500, 5),
+        (3600, 10),
+        (3700, 25),
+        (3800, 45),
+        (3900, 65),
+        (4000, 80),
+        (4100, 90),
+        (4200, 100),
+    ];
+    if vbat_mv >= CURVE[CURVE.len() - 1].0 {
+        return 100;
+    }
+    if vbat_mv <= CURVE[0].0 {
+        return 0;
+    }
+    for w in CURVE.windows(2) {
+        let (lo_mv, lo_pc) = w[0];
+        let (hi_mv, hi_pc) = w[1];
+        if vbat_mv <= hi_mv {
+            let span_mv = hi_mv - lo_mv;
+            let span_pc = (hi_pc - lo_pc) as i32;
+            let off_mv = vbat_mv - lo_mv;
+            return (lo_pc as i32 + off_mv * span_pc / span_mv) as i8;
+        }
+    }
+    -1
 }
 
 fn redraw<DI, SIZE>(
@@ -192,13 +286,6 @@ where
         .draw(disp)
         .ok();
 
-    // fwd
-    let mut line: Line = Line::new();
-    let _ = write!(line, "fwd: {}", stats.tx_ok.load(Ordering::Relaxed));
-    Text::with_baseline(line.as_str(), Point::new(0, 24), *text_style, Baseline::Top)
-        .draw(disp)
-        .ok();
-
     // tx ok/fail
     let mut line: Line = Line::new();
     let _ = write!(
@@ -207,7 +294,7 @@ where
         stats.tx_ok.load(Ordering::Relaxed),
         stats.tx_fail.load(Ordering::Relaxed),
     );
-    Text::with_baseline(line.as_str(), Point::new(0, 35), *text_style, Baseline::Top)
+    Text::with_baseline(line.as_str(), Point::new(0, 24), *text_style, Baseline::Top)
         .draw(disp)
         .ok();
 
@@ -221,6 +308,21 @@ where
         stats.peer_count.load(Ordering::Relaxed),
         stats.hellos_rx.load(Ordering::Relaxed),
     );
+    Text::with_baseline(line.as_str(), Point::new(0, 35), *text_style, Baseline::Top)
+        .draw(disp)
+        .ok();
+
+    // battery — "--" when divider not wired (vbat_percent stays at -1
+    // because the floating ADC reads outside the LiPo plausibility
+    // window).
+    let pct = state.vbat_percent.load(Ordering::Relaxed);
+    let mv = state.vbat_mv.load(Ordering::Relaxed);
+    let mut line: Line = Line::new();
+    if pct >= 0 {
+        let _ = write!(line, "bat: {}% ({} mV)", pct, mv);
+    } else {
+        let _ = write!(line, "bat: --");
+    }
     Text::with_baseline(line.as_str(), Point::new(0, 46), *text_style, Baseline::Top)
         .draw(disp)
         .ok();

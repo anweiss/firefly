@@ -71,6 +71,11 @@ fn main() -> Result<()> {
     let sda: esp_idf_svc::hal::gpio::AnyIOPin = peripherals.pins.gpio6.into();
     let scl: esp_idf_svc::hal::gpio::AnyIOPin = peripherals.pins.gpio7.into();
 
+    // Battery sense: 100k:100k divider from BAT to A2 (D2 / GPIO4).
+    // See shared/battery_sense.h for wiring.
+    let adc1 = peripherals.adc1;
+    let vbat_pin = peripherals.pins.gpio4;
+
     // Wi-Fi must be up before EspNow::take() (ESP-NOW rides the same
     // radio interface). On failure we still proceed — without Wi-Fi
     // there's no DJ Link, but ESP-NOW alone can broadcast a free-running
@@ -96,7 +101,7 @@ fn main() -> Result<()> {
     // FreeRTOS task — runs on its own thread so I²C latency cannot
     // gallop the 200 Hz broadcast loop. Silently no-ops if no display.
     let live_state = Arc::new(LiveState::default());
-    if let Err(e) = display::spawn(i2c0, sda, scl, live_state.clone(), stats.clone()) {
+    if let Err(e) = display::spawn(i2c0, sda, scl, adc1, vbat_pin, live_state.clone(), stats.clone()) {
         warn!("OLED: failed to spawn display thread: {:?}", e);
     }
 

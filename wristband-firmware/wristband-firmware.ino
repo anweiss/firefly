@@ -16,6 +16,7 @@
 #include "../shared/protocol.h"
 #include "../shared/oled_display.h"
 #include "../shared/beat_clock.h"
+#include "../shared/battery_sense.h"
 
 // ── Hardware config ─────────────────────────────────────────────────
 
@@ -24,6 +25,10 @@
 #define LED_TYPE      WS2813
 #define COLOR_ORDER   GRB
 #define MAX_BRIGHTNESS 255        // full brightness — very bright, very clear
+
+// Battery sense — 100k:100k divider from BAT to A2 (D2 / GPIO4).
+// See shared/battery_sense.h for wiring details.
+#define VBAT_ADC_PIN  A2
 
 // ESP-NOW channel — must match dongle.
 // Channel 6 chosen as a mid-spectrum compromise: avoids ch 1/11 which
@@ -107,6 +112,15 @@ static oled_display_t oled;
 static uint32_t last_oled_ms = 0;
 static TaskHandle_t oled_task_handle = nullptr;
 
+// ── Battery sense state ─────────────────────────────────────────────
+//
+// Sampled by the OLED task every refresh tick (~250 ms) and smoothed
+// with a slow EMA so the displayed percentage doesn't twitch on each
+// LED flash drawing current. A single read takes <100 µs and never
+// blocks ESP-NOW RX.
+static volatile int32_t  vbat_mv_smoothed = 0;       // 0 = uninitialised
+static volatile int8_t   vbat_percent     = -1;       // -1 = unknown / no divider
+
 // ── Pairing/hello state ─────────────────────────────────────────────
 //
 // When ESP-NOW broadcast RX is unreliable on this platform (notably
@@ -131,6 +145,25 @@ static int64_t local_time_us() {
 // Convert coordinator timestamp to local clock domain
 static int64_t to_local_time(int64_t coordinator_us) {
     return coordinator_us - clock_offset_us;
+}
+
+// Sample the battery via the divider on VBAT_ADC_PIN. Smooths into
+// vbat_mv_smoothed with a slow EMA (alpha = 1/8) so brief LED-current
+// brownouts don't drag the displayed percentage. Updates vbat_percent.
+static void sample_battery() {
+    // analogReadMilliVolts is calibrated against the on-chip eFuse
+    // reference (±50 mV typical) — much better than analogRead +
+    // hand-rolled scaling. Returns mV at the ADC pin (0–3300 mV with
+    // default DB_11 attenuation on ESP32-C3).
+    uint32_t adc_mv = analogReadMilliVolts(VBAT_ADC_PIN);
+    int32_t  bat_mv = (int32_t)adc_mv *
+                      FIREFLY_VBAT_DIVIDER_NUM / FIREFLY_VBAT_DIVIDER_DEN;
+    if (vbat_mv_smoothed == 0) {
+        vbat_mv_smoothed = bat_mv;
+    } else {
+        vbat_mv_smoothed = (vbat_mv_smoothed * 7 + bat_mv) / 8;
+    }
+    vbat_percent = firefly_battery_percent(vbat_mv_smoothed);
 }
 
 // ── ESP-NOW send callback ──────────────────────────────────────────
@@ -509,6 +542,9 @@ static inline bool stream_is_live() {
 static void oled_task(void *) {
     static uint8_t last_displayed_beat = 0xFF;
     for (;;) {
+        // Sample battery once per refresh tick (cheap: <100 µs).
+        sample_battery();
+
         if (oled.present) {
             bool live = stream_is_live();
             bool is_playing_now = (latest_flags & FIREFLY_FLAG_PLAYING) != 0;
@@ -538,6 +574,17 @@ static void oled_task(void *) {
                      (unsigned long)any_frames,
                      (unsigned long)hellos_send_ok);
             firefly_oled_kv(&oled, 3, "rf ", line);
+
+            // Battery row — "—" when divider isn't wired (vbat_percent
+            // is -1 because the floating ADC reads outside the LiPo
+            // plausibility window).
+            if (vbat_percent >= 0) {
+                snprintf(line, sizeof(line), "%d%% (%ld mV)",
+                         (int)vbat_percent, (long)vbat_mv_smoothed);
+            } else {
+                snprintf(line, sizeof(line), "--");
+            }
+            firefly_oled_kv(&oled, 4, "bat", line);
 
             firefly_oled_flush(&oled);
             last_displayed_beat = cur_beat;

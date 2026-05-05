@@ -133,6 +133,25 @@ Requirements:
 * 1× 3.7 V LiPo with JST-PH 2.0 connector per wristband
 * USB-C data cables
 
+### Battery monitoring (optional)
+
+Both `firefly-fw` and the wristbands display a battery percentage on the OLED
+when a **100 kΩ : 100 kΩ voltage divider** is wired from the BAT pin to
+**GPIO4 (D2 / A2)** of the XIAO ESP32-C3:
+
+```
+BAT ──[100 kΩ]──┬──[100 kΩ]── GND
+                │
+                └── A2 / D2 / GPIO4 (ADC1_CH4)
+```
+
+The divider halves the LiPo voltage so it fits within the ADC's 0–3.3 V range
+(at DB_12 attenuation). Without it the firmware shows `bat: --` (the floating
+ADC reading falls outside the 2500–4400 mV plausibility window, see
+`shared/battery_sense.h`). The percentage uses a piecewise-linear LiPo
+discharge curve and is EMA-smoothed (α=1/8) to absorb the brief sag during
+LED flashes.
+
 ## Clock Synchronization
 
 Wristbands track the offset between the broadcaster's clock and their local clock using an exponential moving average (EMA, α=0.1). Packets carry "the next beat will happen at time T" rather than "beat now" — ESP-NOW jitter is absorbed into scheduling lead time so all wristbands flash within microseconds of each other. PLL anchor in `tick_predicted_beats` lets the wristband interpolate smoothly across short ESP-NOW outages (e.g. the occasional ~500 ms burst when Wi-Fi STA preempts the radio for beacon recovery).

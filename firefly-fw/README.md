@@ -102,6 +102,9 @@ checkout is ~1 GB.
 - **Solder the IPEX U.FL external antenna** on the XIAO. The PCB
   antenna detunes badly without a USB-cable counterpoise and is
   unreliable on battery / charger power.
+- **Battery percentage** on the OLED requires a 100 kΩ : 100 kΩ
+  divider from BAT to GPIO4 (D2 / A2). See "Battery monitoring" in the
+  root README. Without the divider the OLED shows `bat: --`.
 
 ## What's not yet ported from the host coordinator
 
