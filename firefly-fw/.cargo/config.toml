@@ -1,0 +1,19 @@
+[build]
+target = "riscv32imc-esp-espidf"
+
+[target.'cfg(target_os = "espidf")']
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32c3"
+ESP_IDF_VERSION = "v5.2.2"
+
+# Wi-Fi credentials are baked in at build time. Override on the command
+# line with: WIFI_SSID=mynet WIFI_PASS=secret cargo build --release
+WIFI_SSID = { value = "firefly", force = false, relative = false }
+WIFI_PASS = { value = "fireflypass", force = false, relative = false }

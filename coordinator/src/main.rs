@@ -12,6 +12,7 @@ use ableton_link_rs::link::{BasicLink, SessionState};
 use clap::Parser;
 use crc::{Algorithm, Crc};
 use prodjlink_rs::{BeatEvent, ProDjLink};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 // ── Protocol v2 constants ───────────────────────────────────────────
@@ -46,13 +47,62 @@ const TEMPO_EPSILON: f64 = 0.05;
 
 // ── CLI ─────────────────────────────────────────────────────────────
 
+/// USB Vendor ID for Espressif Systems (matches ESP32-C3 builtin USB-CDC).
+const ESPRESSIF_USB_VID: u16 = 0x303A;
+
+/// Resolve which serial port to use. If `requested` is `Some`, use it
+/// verbatim. Otherwise, scan available ports and pick the unique USB-CDC
+/// device whose vendor ID matches Espressif (the Firefly dongle is a
+/// XIAO ESP32-C3 using the builtin USB-JTAG/CDC peripheral).
+fn resolve_port_path(requested: Option<&str>) -> Result<String, String> {
+    if let Some(p) = requested {
+        return Ok(p.to_string());
+    }
+
+    let ports = serialport::available_ports()
+        .map_err(|e| format!("failed to enumerate serial ports: {e}"))?;
+
+    let candidates: Vec<&serialport::SerialPortInfo> = ports
+        .iter()
+        .filter(|p| matches!(
+            &p.port_type,
+            serialport::SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_USB_VID
+        ))
+        .filter(|p| {
+            // On macOS, serialport enumerates both /dev/tty.* (blocking)
+            // and /dev/cu.* (non-blocking call-out). We always want cu.*.
+            !p.port_name.starts_with("/dev/tty.")
+        })
+        .collect();
+
+    match candidates.len() {
+        0 => Err(
+            "no Firefly dongle auto-detected (no Espressif USB-CDC device found). \
+             Plug it in or pass --port <path>."
+                .to_string(),
+        ),
+        1 => Ok(candidates[0].port_name.clone()),
+        _ => {
+            let names: Vec<&str> =
+                candidates.iter().map(|p| p.port_name.as_str()).collect();
+            Err(format!(
+                "multiple Espressif USB-CDC devices found ({}). \
+                 Disambiguate with --port <path>.",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "firefly-coordinator")]
 #[command(about = "DJ Link + Ableton Link → ESP-NOW bridge for Firefly wristbands")]
 struct Args {
-    /// Serial port path (e.g. /dev/cu.usbmodem1101)
+    /// Serial port path (e.g. /dev/cu.usbmodem1101).
+    /// If omitted, auto-detects an attached Firefly dongle by USB VID
+    /// (0x303A — Espressif ESP32-C3).
     #[arg(short, long)]
-    port: String,
+    port: Option<String>,
 
     /// Serial baud rate
     #[arg(short, long, default_value_t = 115200)]
@@ -66,8 +116,13 @@ struct Args {
     #[arg(short, long, default_value_t = 4.0)]
     quantum: f64,
 
-    /// Broadcast rate in Hz
-    #[arg(long, default_value_t = 20)]
+    /// Broadcast rate in Hz. The wristband flashes reactively the
+    /// instant a packet arrives carrying a new beat-in-bar, so the
+    /// upper bound on flash jitter is roughly half the broadcast
+    /// period. 200 Hz keeps that under ~2.5 ms — well below human
+    /// perception of beat-timing variation — while staying within
+    /// USB CDC and ESP-NOW bandwidth (~62% of 115200 baud).
+    #[arg(long, default_value_t = 200)]
     rate: u32,
 
     /// Network interface IP for DJ Link (e.g. 192.168.1.145).
@@ -158,6 +213,13 @@ fn on_air_to_mask(channels: &HashMap<u8, bool>) -> u8 {
 
 // ── Beat source state machine ───────────────────────────────────────
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum CdjPlayTransition {
+    None,
+    Paused,
+    PlayStarted,
+}
+
 /// Extracted CDJ beat-processing state, testable without real hardware.
 struct BeatSourceState {
     last_cdj_beat_time: Instant,
@@ -170,6 +232,34 @@ struct BeatSourceState {
     channels_on_air: HashMap<u8, bool>,
     last_beat_in_bar: u8,
     bar_counter: u8,
+    // Phase-locked smoothed timestamp of the most recent CDJ beat.
+    // Raw CDJ Beat packets arrive over UDP with variable network
+    // latency (per-beat jitter of several ms), so deriving next-beat
+    // predictions directly from the raw arrival time produces visible
+    // jitter on any consumer that schedules off `cdj_next_beat_us`.
+    // The wristband no longer schedules predictively (it reacts to
+    // `beat_in_bar` changes instead), but the OLED beat-extrapolation
+    // helper on both dongle and wristband still uses these fields, so
+    // smoother values produce a smoother beat counter.
+    last_smoothed_beat_us: i64,
+    have_smoothed_beat: bool,
+    // Pending beat-in-bar transition deferred to the smoothed grid.
+    // Raw CDJ Beat events arrive jittery; advancing `cdj_beat_in_bar`
+    // immediately on arrival propagates that jitter to the wristband
+    // (which flashes when `beat_in_bar` changes in the packet stream).
+    // Instead we record the *target* beat number plus the smoothed
+    // time at which the transition should become visible, and apply
+    // it from `tick_predicted_beats` once the smoothed boundary
+    // elapses. This makes the wire-level beat edge as smooth as the
+    // PLL output, independent of CDJ Beat-event arrival jitter.
+    pending_beat_in_bar: Option<u8>,
+    pending_beat_at_us: i64,
+    // One-shot flag set when CDJ status reports a paused→playing
+    // transition. Causes the next outgoing packet to carry
+    // `next_beat_us = send_time_us` so the wristband schedules an
+    // immediate flash, giving the user instant LED feedback when they
+    // press PLAY or CUE on the deck.
+    pending_play_flash: bool,
 }
 
 impl BeatSourceState {
@@ -185,6 +275,11 @@ impl BeatSourceState {
             channels_on_air: HashMap::new(),
             last_beat_in_bar: u8::MAX,
             bar_counter: 0,
+            last_smoothed_beat_us: 0,
+            have_smoothed_beat: false,
+            pending_beat_in_bar: None,
+            pending_beat_at_us: 0,
+            pending_play_flash: false,
         }
     }
 
@@ -193,7 +288,7 @@ impl BeatSourceState {
     fn process_master_beat(&mut self, beat: &prodjlink_rs::Beat, now: Instant, link_clock_us: i64) {
         self.last_cdj_beat_time = now;
         self.cdj_bpm = beat.effective_tempo();
-        self.cdj_beat_in_bar = if beat.beat_within_bar > 0 {
+        let target_beat_in_bar = if beat.beat_within_bar > 0 {
             beat.beat_within_bar - 1
         } else {
             0
@@ -201,21 +296,126 @@ impl BeatSourceState {
         self.cdj_playing = true;
         self.master_device = beat.device_number.0;
 
-        self.cdj_next_beat_us = beat
-            .next_beat
-            .map(|ms| link_clock_us + (ms as i64) * 1000)
-            .unwrap_or(0);
+        // Phase-locked smoothing of the beat timestamp.
+        //
+        // Raw arrival time `link_clock_us` is jittery by several ms.
+        // We compute the expected next-beat time from the previous
+        // smoothed timestamp + tempo period, then blend a small
+        // fraction of the (raw - expected) error into a new estimate.
+        // This averages out per-beat UDP jitter while still tracking
+        // tempo drift and recovering quickly from large errors.
+        let beat_period_us = if self.cdj_bpm > 0.0 {
+            (60_000_000.0_f64 / self.cdj_bpm).round() as i64
+        } else {
+            0
+        };
 
-        self.cdj_next_bar_us = beat
-            .next_bar
-            .map(|ms| link_clock_us + (ms as i64) * 1000)
-            .unwrap_or(0);
+        let smoothed_beat_us = if self.have_smoothed_beat && beat_period_us > 0 {
+            let expected = self.last_smoothed_beat_us + beat_period_us;
+            let error = link_clock_us - expected;
+            // Snap on big errors (>half a beat → tempo change, seek,
+            // track switch). Otherwise apply low-gain (1/8) correction.
+            if error.abs() > beat_period_us / 2 {
+                link_clock_us
+            } else {
+                expected + error / 8
+            }
+        } else {
+            link_clock_us
+        };
+        self.last_smoothed_beat_us = smoothed_beat_us;
+        self.have_smoothed_beat = true;
+
+        // Defer the beat_in_bar transition until the smoothed time of
+        // this beat has elapsed. This is the whole point of PLL
+        // smoothing — apply it at the *visible edge* (the wire-level
+        // beat_in_bar change that the wristband flashes on), not just
+        // to the next-beat predictions. Promotion happens in
+        // `tick_predicted_beats`, which is called every broadcast
+        // tick (≤5 ms). Deferring uniformly — even when the smoothed
+        // boundary is already in the past — keeps the visible edge
+        // jitter symmetric: ≤5 ms of broadcast-tick latency, no
+        // arrival-jitter component.
+        self.pending_beat_in_bar = Some(target_beat_in_bar);
+        self.pending_beat_at_us = smoothed_beat_us;
+
+        // Predict next-beat / next-bar from the smoothed timestamp +
+        // tempo grid. This produces an evenly-spaced beat sequence
+        // even when CDJ Beat packets arrive with variable latency.
+        if beat_period_us > 0 {
+            self.cdj_next_beat_us = smoothed_beat_us + beat_period_us;
+            // beats remaining in current bar (k=0 means we just hit a
+            // downbeat → next downbeat is 4 beats away)
+            let beats_to_bar = if target_beat_in_bar == 0 {
+                4
+            } else {
+                4 - target_beat_in_bar as i64
+            };
+            self.cdj_next_bar_us = smoothed_beat_us + beats_to_bar * beat_period_us;
+        } else {
+            // Tempo unknown — fall back to the raw fields from the packet.
+            self.cdj_next_beat_us = beat
+                .next_beat
+                .map(|ms| link_clock_us + (ms as i64) * 1000)
+                .unwrap_or(0);
+            self.cdj_next_bar_us = beat
+                .next_bar
+                .map(|ms| link_clock_us + (ms as i64) * 1000)
+                .unwrap_or(0);
+        }
+    }
+
+    /// Apply a CDJ status update. CDJs send status packets at ~30Hz
+    /// regardless of whether they are playing, so this gives us
+    /// near-immediate detection of pause / cue (within ~33ms) instead
+    /// of waiting for the 2s beat timeout.
+    ///
+    /// Returns the detected play-state transition, if any.
+    fn process_cdj_status(
+        &mut self,
+        status: &prodjlink_rs::protocol::status::CdjStatus,
+    ) -> CdjPlayTransition {
+        // Filter to the device that produced our last beat. On first
+        // play (master_device==0), accept the first playing CDJ as
+        // master so we get an immediate flash even before the first
+        // Beat event has arrived.
+        let now_playing = status.is_playing();
+        if self.master_device == 0 {
+            if now_playing {
+                self.master_device = status.device_number.0;
+                self.cdj_playing = true;
+                self.pending_play_flash = true;
+                return CdjPlayTransition::PlayStarted;
+            }
+            return CdjPlayTransition::None;
+        }
+        if status.device_number.0 != self.master_device {
+            return CdjPlayTransition::None;
+        }
+        if self.cdj_playing && !now_playing {
+            self.cdj_playing = false;
+            self.have_smoothed_beat = false;
+            self.pending_beat_in_bar = None;
+            self.pending_play_flash = false;
+            return CdjPlayTransition::Paused;
+        }
+        if !self.cdj_playing && now_playing {
+            self.cdj_playing = true;
+            self.pending_play_flash = true;
+            return CdjPlayTransition::PlayStarted;
+        }
+        CdjPlayTransition::None
     }
 
     /// Returns `true` if CDJ timed out and state transitioned to not-playing.
     fn check_cdj_timeout(&mut self, now: Instant) -> bool {
         if self.cdj_playing && (now - self.last_cdj_beat_time) > CDJ_TIMEOUT {
             self.cdj_playing = false;
+            // Reset PLL so a re-acquired CDJ stream starts fresh
+            // instead of trying to snap from a stale previous-beat
+            // timestamp seconds in the past.
+            self.have_smoothed_beat = false;
+            self.pending_beat_in_bar = None;
             true
         } else {
             false
@@ -225,6 +425,68 @@ impl BeatSourceState {
     /// Whether the CDJ is currently the timing authority.
     fn is_cdj_active(&self, now: Instant) -> bool {
         self.cdj_playing && (now - self.last_cdj_beat_time) < CDJ_TIMEOUT
+    }
+
+    /// Advance `cdj_beat_in_bar` / `cdj_next_beat_us` / `cdj_next_bar_us`
+    /// forward in step with the PLL-smoothed beat grid, *between* CDJ
+    /// Beat events. This makes the broadcast packet stream robust to
+    /// occasional missed CDJ events (channel hiccups, transient
+    /// `tempo_master()` mis-classification, etc.). When a real CDJ
+    /// Beat event eventually arrives, `process_master_beat` snaps
+    /// authoritatively, so any small prediction drift is corrected.
+    ///
+    /// Without this, a single missed Beat event causes the wristband's
+    /// `latest_beat_in_bar` to jump by 2, skipping a flash + counter
+    /// tick visibly.
+    fn tick_predicted_beats(&mut self, link_clock_us: i64) -> bool {
+        if !self.cdj_playing || self.cdj_bpm <= 0.0 {
+            return false;
+        }
+        let beat_period_us = (60_000_000.0_f64 / self.cdj_bpm).round() as i64;
+        if beat_period_us <= 0 {
+            return false;
+        }
+        let mut advanced = false;
+
+        // Promote any pending beat-in-bar transition whose smoothed
+        // boundary time has now elapsed. This is the deferred half of
+        // `process_master_beat`'s smoothing.
+        if let Some(target) = self.pending_beat_in_bar {
+            if link_clock_us >= self.pending_beat_at_us {
+                self.cdj_beat_in_bar = target;
+                self.pending_beat_in_bar = None;
+                advanced = true;
+            }
+        }
+
+        let mut guard = 0;
+        while self.cdj_next_beat_us > 0
+            && link_clock_us >= self.cdj_next_beat_us
+            && guard < 8
+        {
+            self.cdj_beat_in_bar = (self.cdj_beat_in_bar + 1) % 4;
+            // The boundary we just crossed *was* `cdj_next_beat_us`.
+            // Use it (not `last_smoothed_beat_us`) to derive the new
+            // next-bar prediction, and DO NOT touch the PLL anchor:
+            // `last_smoothed_beat_us` must continue to point at the
+            // most recently *processed CDJ event*, otherwise the
+            // PLL's `expected = last_smoothed + period` calculation
+            // double-counts the tick advancement and produces a
+            // ~one-period error on every subsequent CDJ event,
+            // which then snaps the grid and makes downbeats land at
+            // wrong audio positions.
+            let just_advanced_at = self.cdj_next_beat_us;
+            self.cdj_next_beat_us += beat_period_us;
+            let beats_to_bar = if self.cdj_beat_in_bar == 0 {
+                4
+            } else {
+                4 - self.cdj_beat_in_bar as i64
+            };
+            self.cdj_next_bar_us = just_advanced_at + beats_to_bar * beat_period_us;
+            guard += 1;
+            advanced = true;
+        }
+        advanced
     }
 
     fn on_air_mask(&self) -> u8 {
@@ -253,9 +515,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
+    // Resolve serial port (auto-detect if --port not provided)
+    let port_path = match resolve_port_path(args.port.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("{e}");
+            return Err(e.into());
+        }
+    };
+    if args.port.is_none() {
+        info!(port = %port_path, "auto-detected Firefly dongle");
+    }
+
     // Open serial port
-    info!(port = %args.port, baud = args.baud, "opening serial port");
-    let mut port = serialport::new(&args.port, args.baud)
+    info!(port = %port_path, baud = args.baud, "opening serial port");
+    let mut port = serialport::new(&port_path, args.baud)
         .timeout(Duration::from_millis(100))
         .open()?;
     port.clear(serialport::ClearBuffer::All)?;
@@ -268,6 +542,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut link = BasicLink::new(args.bpm).await;
     link.enable().await;
+
+    // In Link-only mode (no DJ Link), auto-start the Link transport so beats
+    // are emitted to wristbands. Without this, is_playing stays false and the
+    // wristband won't flash.
+    if args.no_djlink {
+        let time = link.clock().micros();
+        let mut session = link.capture_app_session_state();
+        session.set_is_playing(true, time);
+        link.commit_app_session_state(session).await;
+        info!("Link transport auto-started (no-djlink mode)");
+    }
 
     link.set_num_peers_callback(|count| {
         info!(peers = count, "Link peer count changed");
@@ -307,6 +592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subscribe to DJ Link events
     let mut beats_rx = pdl.as_ref().map(|p| p.subscribe_beats());
     let mut on_air_rx = pdl.as_ref().map(|p| p.subscribe_on_air());
+    let mut status_rx = pdl.as_ref().map(|p| p.subscribe_status());
 
     // Beat source state
     let mut state = BeatSourceState::new();
@@ -316,12 +602,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.rate
     );
 
-    let interval = Duration::from_micros(1_000_000 / args.rate as u64);
+    let interval_dur = Duration::from_micros(1_000_000 / args.rate as u64);
+    // Use a fixed-rate ticker so the broadcast period is independent
+    // of how long the loop body takes (CDJ event drains, Link state
+    // captures, etc.). With `tokio::time::sleep(interval)` the loop
+    // period drifts to body_time + interval, which causes beat-edge
+    // packets to arrive at slightly different positions within the
+    // loop quantum on successive beats — perceptible as swing.
+    let mut ticker = tokio::time::interval(interval_dur);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let quantum = args.quantum;
+
+    // ── Stdin command channel (runtime tempo override) ─────────────
+    // Read a BPM number on stdin (followed by newline) to update tempo
+    // in flight. Useful for testing the wristband flash response to
+    // tempo changes without needing a Link peer or CDJ.
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<f64>();
+    {
+        let cmd_tx = cmd_tx.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdin.read_line(&mut line).is_err() {
+                    break;
+                }
+                if line.is_empty() {
+                    // EOF
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match trimmed.parse::<f64>() {
+                    Ok(bpm) if (20.0..=300.0).contains(&bpm) => {
+                        if cmd_tx.send(bpm).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        eprintln!("(stdin) ignored '{}': enter a BPM 20–300", trimmed);
+                    }
+                }
+            }
+        });
+    }
+    drop(cmd_tx);
 
     loop {
         if !running.load(Ordering::SeqCst) {
             break;
+        }
+
+        // ── Apply any pending tempo overrides from stdin ────────────
+        while let Ok(new_bpm) = cmd_rx.try_recv() {
+            let time = link.clock().micros();
+            let mut session = link.capture_app_session_state();
+            session.set_tempo(new_bpm, time);
+            link.commit_app_session_state(session).await;
+            info!(bpm = format!("{:.2}", new_bpm), "tempo override (stdin)");
         }
 
         // ── Drain DJ Link events (non-blocking) ────────────────────
@@ -358,6 +699,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             session.set_is_playing(true, time);
                             link.commit_app_session_state(session).await;
                         }
+
+                        // NOTE: no immediate beat-edge serial write
+                        // here. Doing so would carry the just-arrived
+                        // (raw, jittery) beat_in_bar to the wristband
+                        // and bypass the PLL smoothing performed in
+                        // `process_master_beat` / `tick_predicted_beats`.
+                        // The 200 Hz periodic broadcast below picks
+                        // up the smoothed transition within ≤5 ms of
+                        // the smoothed boundary, which is what makes
+                        // the visible beat edge steady.
                     }
                 }
             }
@@ -377,6 +728,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if let Some(ref mut rx) = status_rx {
+            while let Ok(update) = rx.try_recv() {
+                if let prodjlink_rs::protocol::status::DeviceUpdate::Cdj(cdj) = update {
+                    match state.process_cdj_status(&cdj) {
+                        CdjPlayTransition::Paused => {
+                            info!(
+                                device = cdj.device_number.0,
+                                "CDJ master paused/cued — wristband flash off"
+                            );
+                            let time = link.clock().micros();
+                            let mut session = link.capture_app_session_state();
+                            session.set_is_playing(false, time);
+                            link.commit_app_session_state(session).await;
+                        }
+                        CdjPlayTransition::PlayStarted => {
+                            info!(
+                                device = cdj.device_number.0,
+                                "CDJ master play/cue pressed — firing immediate flash"
+                            );
+                            let time = link.clock().micros();
+                            let mut session = link.capture_app_session_state();
+                            session.set_is_playing(true, time);
+                            link.commit_app_session_state(session).await;
+                        }
+                        CdjPlayTransition::None => {}
+                    }
+                }
+            }
+        }
+
         // ── CDJ timeout detection ──────────────────────────────────
         if state.check_cdj_timeout(Instant::now()) {
             info!("CDJ beat timeout — falling back to Link-only");
@@ -390,6 +771,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let now = link.clock().micros();
         let session = link.capture_app_session_state();
         let cdj_active = state.is_cdj_active(Instant::now());
+
+        // Tick the predicted beat grid forward for any beat
+        // boundaries that have elapsed since the last CDJ event we
+        // saw. This keeps `cdj_beat_in_bar` advancing on schedule
+        // even if a CDJ Beat event was occasionally missed.
+        let now_us_for_tick = now.num_microseconds().unwrap_or(0);
+        state.tick_predicted_beats(now_us_for_tick);
 
         let (tempo, beat_in_bar, next_db_us, next_bt_us, is_playing) = if cdj_active {
             // CDJ is authoritative
@@ -436,6 +824,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             flags |= FLAG_CDJ_ACTIVE;
         }
 
+        // One-shot immediate-flash injection: when the user pressed
+        // PLAY or CUE on the deck, status detection set
+        // `pending_play_flash`. Override `next_bt_us = send_time_us`
+        // so the wristband schedules a flash for "now" — instant LED
+        // feedback within ~33 ms of the button press, instead of
+        // waiting up to one beat for the first Beat event to arrive.
+        let mut next_bt_us = next_bt_us;
+        if state.pending_play_flash {
+            next_bt_us = send_time_us;
+            flags |= FLAG_PLAYING;
+            state.pending_play_flash = false;
+        }
+
         let on_air_mask = state.on_air_mask();
         let master_dev = if cdj_active { state.master_device } else { 0 };
 
@@ -464,14 +865,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 warn!(error = %e, "serial write failed — dongle disconnected?");
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                match serialport::new(&args.port, args.baud)
+                // Re-resolve the port on reconnect — usbmodem paths can
+                // change after a device reset, and the user may have
+                // swapped dongles.
+                let reconnect_path = resolve_port_path(args.port.as_deref())
+                    .unwrap_or_else(|_| port_path.clone());
+                match serialport::new(&reconnect_path, args.baud)
                     .timeout(Duration::from_millis(100))
                     .open()
                 {
                     Ok(new_port) => {
                         port = new_port;
                         let _ = port.clear(serialport::ClearBuffer::All);
-                        info!("serial port reconnected");
+                        info!(port = %reconnect_path, "serial port reconnected");
                     }
                     Err(e) => {
                         error!(error = %e, "serial reconnect failed");
@@ -480,7 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        tokio::time::sleep(interval).await;
+        ticker.tick().await;
     }
 
     info!("shutting down");
@@ -621,16 +1027,139 @@ mod tests {
         let link_clock_us: i64 = 1_000_000;
 
         state.process_master_beat(&beat, now, link_clock_us);
+        // beat_in_bar transitions are deferred to the broadcast tick
+        // for jitter immunity; promote the pending one explicitly
+        // before asserting on it.
+        state.tick_predicted_beats(link_clock_us);
 
         assert_eq!(state.last_cdj_beat_time, now);
         assert!((state.cdj_bpm - 128.0).abs() < 0.01);
         assert_eq!(state.cdj_beat_in_bar, 2); // 3 (1-based) → 2 (0-based)
         assert!(state.cdj_playing);
         assert_eq!(state.master_device, 2);
-        // next_beat=500ms → link_clock + 500*1000 = 1_500_000
-        assert_eq!(state.cdj_next_beat_us, 1_500_000);
-        // next_bar=2000ms → link_clock + 2000*1000 = 3_000_000
-        assert_eq!(state.cdj_next_bar_us, 3_000_000);
+        // next_beat / next_bar are now derived from tempo (not the
+        // jittery `next_beat` field on the Beat packet). At 128 BPM
+        // the beat period is 60_000_000/128 ≈ 468_750 µs.
+        let beat_period_us = (60_000_000.0_f64 / 128.0).round() as i64;
+        // First call seeds the PLL with link_clock_us.
+        assert_eq!(state.cdj_next_beat_us, link_clock_us + beat_period_us);
+        // beat_in_bar=2 (0-based), 2 beats remaining until next bar.
+        assert_eq!(state.cdj_next_bar_us, link_clock_us + 2 * beat_period_us);
+    }
+
+    #[test]
+    fn process_master_beat_smooths_jitter() {
+        let mut state = BeatSourceState::new();
+        let beat_period_us = (60_000_000.0_f64 / 128.0).round() as i64;
+        let now = Instant::now();
+
+        // Beat #1 at t=1_000_000 (seeds PLL)
+        state.process_master_beat(&make_test_beat(2, 128.0, 1), now, 1_000_000);
+        assert_eq!(state.last_smoothed_beat_us, 1_000_000);
+
+        // Beat #2 arrives 5ms late (jitter). Without smoothing,
+        // last_smoothed_beat_us would be 1_000_000 + period + 5_000.
+        // With α=1/8 PLL gain, the error contribution is 5_000/8 ≈ 625.
+        let jittered = 1_000_000 + beat_period_us + 5_000;
+        state.process_master_beat(&make_test_beat(2, 128.0, 2), now, jittered);
+        let expected_smoothed = 1_000_000 + beat_period_us + 5_000 / 8;
+        assert!(
+            (state.last_smoothed_beat_us - expected_smoothed).abs() <= 1,
+            "smoothed={} expected≈{}",
+            state.last_smoothed_beat_us,
+            expected_smoothed
+        );
+
+        // Large error (e.g. tempo change / track switch): snap.
+        let snapped = state.last_smoothed_beat_us + 10 * beat_period_us;
+        state.process_master_beat(&make_test_beat(2, 128.0, 3), now, snapped);
+        assert_eq!(state.last_smoothed_beat_us, snapped);
+    }
+
+    #[test]
+    fn tick_predicted_beats_advances_when_cdj_event_missed() {
+        // Simulates a missed CDJ Beat event: after the first beat is
+        // processed, no further events arrive. The predicted-tick
+        // helper should still advance `cdj_beat_in_bar` on schedule
+        // when the broadcast loop runs after the next beat boundary.
+        let mut state = BeatSourceState::new();
+        let beat_period_us = (60_000_000.0_f64 / 128.0).round() as i64;
+        let now = Instant::now();
+
+        // Seed: master beat at t=1_000_000, beat-in-bar 2 (1-based) → 1
+        state.process_master_beat(&make_test_beat(2, 128.0, 2), now, 1_000_000);
+        // beat_in_bar promotion is deferred to the broadcast tick.
+        state.tick_predicted_beats(1_000_000);
+        assert_eq!(state.cdj_beat_in_bar, 1);
+        let next_after_seed = state.cdj_next_beat_us;
+        assert_eq!(next_after_seed, 1_000_000 + beat_period_us);
+
+        // Broadcast loop ticks slightly past the next beat boundary
+        // without a new CDJ event having arrived.
+        let advanced = state.tick_predicted_beats(next_after_seed + 1_000);
+        assert!(advanced, "tick should have advanced over a beat boundary");
+        assert_eq!(state.cdj_beat_in_bar, 2);
+        assert_eq!(state.cdj_next_beat_us, 1_000_000 + 2 * beat_period_us);
+
+        // Two more boundaries: should advance to beat-in-bar 0 (downbeat).
+        // We pass a clock just *before* the bar's 4th beat boundary so
+        // the loop stops after crossing the boundary that lands at
+        // bib=0.
+        let advanced = state.tick_predicted_beats(1_000_000 + 4 * beat_period_us - 1_000);
+        assert!(advanced);
+        assert_eq!(state.cdj_beat_in_bar, 0);
+        // After landing on the downbeat, next beat is one period later
+        // and the next bar is a full bar after that downbeat.
+        assert_eq!(state.cdj_next_beat_us, 1_000_000 + 4 * beat_period_us);
+        assert_eq!(state.cdj_next_bar_us, 1_000_000 + 7 * beat_period_us);
+
+        // No further advance if we haven't crossed another boundary.
+        let advanced = state.tick_predicted_beats(state.cdj_next_beat_us - 100);
+        assert!(!advanced);
+    }
+
+    #[test]
+    fn tick_predicted_beats_no_op_when_cdj_inactive() {
+        let mut state = BeatSourceState::new();
+        // No master beat yet → cdj_playing is false
+        let advanced = state.tick_predicted_beats(1_000_000_000);
+        assert!(!advanced);
+        assert_eq!(state.cdj_beat_in_bar, 0);
+    }
+
+    #[test]
+    fn beat_in_bar_transition_is_deferred_to_smoothed_grid() {
+        // Verifies the gallop fix: when a CDJ beat arrives jittery
+        // (raw arrival time != smoothed-grid time), the visible
+        // `cdj_beat_in_bar` must NOT advance at the raw arrival time.
+        // It advances only when `tick_predicted_beats` is called with
+        // a clock past the *smoothed* boundary.
+        let mut state = BeatSourceState::new();
+        let beat_period_us = (60_000_000.0_f64 / 128.0).round() as i64;
+        let now = Instant::now();
+
+        // Seed PLL with beat #2 (bib=1) at t=1_000_000.
+        state.process_master_beat(&make_test_beat(2, 128.0, 2), now, 1_000_000);
+        state.tick_predicted_beats(1_000_000);
+        assert_eq!(state.cdj_beat_in_bar, 1);
+
+        // Beat #3 (bib=2) arrives 5 ms LATE relative to the PLL grid.
+        // Smoothed time pulls back toward the predicted boundary
+        // (error / 8 ≈ +625 µs), so the visible edge should be at
+        // ~1_000_000 + period + 625, well *before* the raw arrival.
+        let raw_arrival = 1_000_000 + beat_period_us + 5_000;
+        state.process_master_beat(&make_test_beat(2, 128.0, 3), now, raw_arrival);
+
+        // Critical assertion: bib has NOT moved yet — the transition
+        // is queued, not applied, even though raw arrival ≥ smoothed.
+        assert_eq!(state.cdj_beat_in_bar, 1, "bib must defer until tick");
+        assert_eq!(state.pending_beat_in_bar, Some(2));
+
+        // A broadcast tick at the smoothed boundary promotes it.
+        let smoothed = state.pending_beat_at_us;
+        state.tick_predicted_beats(smoothed);
+        assert_eq!(state.cdj_beat_in_bar, 2);
+        assert_eq!(state.pending_beat_in_bar, None);
     }
 
     #[test]
@@ -703,6 +1232,8 @@ mod tests {
         let link_clock_us: i64 = 10_000_000; // 10s into the session
 
         state.process_master_beat(beat, now, link_clock_us);
+        // Promote pending beat-in-bar transition (deferred to broadcast tick).
+        state.tick_predicted_beats(link_clock_us);
         if let Some(channels) = on_air {
             state.update_on_air(channels);
         }
@@ -809,10 +1340,15 @@ mod tests {
         let beat = make_test_beat(1, 126.0, 2);
         let (_state, _pkt, wb) = pipeline(&beat, None);
 
-        // CDJ says next_beat=500ms from now → link_clock(10_000_000) + 500*1000
-        assert_eq!(wb.next_beat_us, 10_500_000);
-        // CDJ says next_bar=2000ms from now → link_clock(10_000_000) + 2000*1000
-        assert_eq!(wb.next_downbeat_us, 12_000_000);
+        // next_beat / next_bar are now derived from tempo (60e6 / 126 BPM
+        // ≈ 476_190 µs per beat) anchored on the smoothed beat
+        // timestamp, instead of the jittery raw `next_beat`/`next_bar`
+        // fields on the Beat packet. First-beat seeds the PLL with
+        // link_clock_us = 10_000_000.
+        let beat_period_us = (60_000_000.0_f64 / 126.0).round() as i64;
+        assert_eq!(wb.next_beat_us, 10_000_000 + beat_period_us);
+        // beat_within_bar=2 (1-based) → 0-based 1 → 3 beats to next bar
+        assert_eq!(wb.next_downbeat_us, 10_000_000 + 3 * beat_period_us);
     }
 
     #[test]
@@ -874,6 +1410,8 @@ mod tests {
             let link_us = 10_000_000 + (i as i64) * (beat_interval_ms as i64) * 1000;
 
             state.process_master_beat(&beat, now, link_us);
+            // Promote pending beat-in-bar transition for assertions.
+            state.tick_predicted_beats(link_us);
 
             let cdj_active = state.is_cdj_active(now);
             let mut flags: u8 = 0;

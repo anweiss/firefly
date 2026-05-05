@@ -32,6 +32,14 @@
 #define FIREFLY_TOTAL_LEN     36
 #define FIREFLY_PACKET_SIZE   36
 
+// Hello/pairing frame (wristband → dongle, ESP-NOW only)
+//   [0..1] sync 0xBE 0xA8
+//   [2..7] wristband MAC
+// 8 bytes total, distinguished from data packets by length and sync[1].
+#define FIREFLY_HELLO_SYNC_0  0xBE
+#define FIREFLY_HELLO_SYNC_1  0xA8
+#define FIREFLY_HELLO_SIZE    8
+
 // Flag bits
 #define FIREFLY_FLAG_PLAYING    (1 << 0)
 #define FIREFLY_FLAG_CDJ_ACTIVE (1 << 1)

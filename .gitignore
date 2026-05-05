@@ -1,4 +1,7 @@
 coordinator/target/
+firefly-fw/target/
+firefly-fw/.embuild/
+**/Cargo.lock.bak
 .vscode/
 *.DS_Store
 tests/test_firmware

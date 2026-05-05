@@ -1,0 +1,37 @@
+[package]
+name = "firefly-fw"
+version = "0.1.0"
+edition = "2021"
+description = "All-in-one Firefly coordinator + ESP-NOW broadcaster firmware for XIAO ESP32-C3"
+publish = false
+
+[[bin]]
+name = "firefly-fw"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[features]
+default = ["std"]
+std = ["esp-idf-svc/std", "esp-idf-svc/binstart"]
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.52", default-features = false }
+anyhow = "1"
+crc = "3"
+heapless = "0.9"
+ssd1306 = "0.9"
+embedded-graphics = "0.8"
+embedded-hal = "1"
+
+[build-dependencies]
+embuild = "0.33"

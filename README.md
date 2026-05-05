@@ -5,12 +5,12 @@ Beat-synced LED wristbands powered by [Pioneer Pro DJ Link](https://github.com/a
 ## Architecture
 
 ```
-┌──────────┐  DJ Link  ┌─────────────────┐  USB Serial  ┌────────────┐  ESP-NOW  ┌────────────┐
+┌──────────┐  DJ Link  ┌──────────────────┐  USB Serial  ┌────────────┐  ESP-NOW ┌────────────┐
 │ CDJ-3000 │──────────►│  Coordinator     │─────────────►│   Dongle   │─ ─ ─ ─ ─►│ Wristband  │
 │ DJM-A9   │           │  (Mac, Rust)     │              │  (ESP32-C3)│          │ (ESP32-C3) │ ×N
 └──────────┘     ┌────►│  prodjlink-rs +  │              └────────────┘          └────────────┘
                  │     │  ableton-link-rs │
-┌──────────┐  Link     └─────────────────┘
+┌──────────┐  Link     └──────────────────┘
 │ Ableton  │─────┘
 │ / other  │
 └──────────┘
@@ -32,11 +32,11 @@ When CDJs are playing, the coordinator uses **CDJ beats as the authoritative tim
 ## DJ Link Features
 
 The coordinator uses [prodjlink-rs](https://github.com/anweiss/prodjlink-rs) to:
-- **Discover CDJs/mixers** on the network and join as a virtual player
-- **Track the tempo master** and use its beat timing directly
-- **Receive on-air status** from the mixer (carried in packets for future effects)
-- **Participate in master handoff** (Baroque dance protocol with auto-negotiate)
-- **Detect play/stop** via beat timeout (2s window)
+* **Discover CDJs/mixers** on the network and join as a virtual player
+* **Track the tempo master** and use its beat timing directly
+* **Receive on-air status** from the mixer (carried in packets for future effects)
+* **Participate in master handoff** (Baroque dance protocol with auto-negotiate)
+* **Detect play/stop** via beat timeout (2s window)
 
 ## Wire Protocol v2
 
@@ -84,10 +84,10 @@ Flash via Arduino IDE:
 
 ## Hardware (Stage 1 Prototype)
 
-- 2× Seeed XIAO ESP32-C3 (pre-soldered headers)
-- 1× Grove RGB LED Stick (WS2813)
-- 1× USB-C data cable
-- 1× 3.7V LiPo with JST-PH 2.0 connector (wristband only)
+* 2× Seeed XIAO ESP32-C3 (pre-soldered headers)
+* 1× Grove RGB LED Stick (WS2813)
+* 1× USB-C data cable
+* 1× 3.7V LiPo with JST-PH 2.0 connector (wristband only)
 
 ## Clock Synchronization
 

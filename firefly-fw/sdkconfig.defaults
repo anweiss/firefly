@@ -1,0 +1,25 @@
+# Bump main task stack — DJ Link parsing + ESP-NOW callbacks need it
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# ESP-NOW + Wi-Fi: we need both. Wi-Fi STA on the same channel as the
+# wristband ESP-NOW peers (channel 11 — see stored memory `espnow channel`).
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# Increase log level filter so log::info! shows up at default level
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# Enable the C3 builtin USB Serial/JTAG console for log output
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Generous lwIP buffers — DJ Link sends UDP at ~30Hz across multiple
+# devices and we don't want to drop status packets.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+
+# We have a busy 200Hz broadcast loop on the main task; the IDLE task
+# can be starved briefly under load. Keep the watchdog enabled but
+# don't gate it on IDLE — the watchdog still catches a truly-stuck
+# main task (we explicitly feed it from the loop just in case).
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n

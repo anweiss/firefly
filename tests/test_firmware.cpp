@@ -7,6 +7,7 @@
 #include "../shared/protocol.h"
 #include "../shared/dongle_logic.h"
 #include "../shared/wristband_logic.h"
+#include "../shared/beat_clock.h"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -510,6 +511,82 @@ TEST(e2e_multi_beat_bar) {
     ASSERT_EQ(wb.beat_in_bar, 3); // last beat was beat 3 (0-based)
 }
 
+// ── Beat clock helper ──────────────────────────────────────────────
+
+TEST(beat_clock_before_next_beat) {
+    // Coordinator clock is still before next_beat_us → display the
+    // packet's snapshot beat unchanged.
+    uint8_t b = firefly_current_beat_in_bar(
+        /*coord_now=*/1'000'000,
+        /*next_beat=*/1'500'000,
+        /*latest_beat=*/1, /*tempo_x100=*/12000, /*quantum=*/4);
+    ASSERT_EQ(b, 1);
+}
+
+TEST(beat_clock_just_after_next_beat) {
+    // 1 us past the next-beat boundary → advance by 1.
+    uint8_t b = firefly_current_beat_in_bar(
+        /*coord_now=*/1'500'001,
+        /*next_beat=*/1'500'000,
+        /*latest_beat=*/1, /*tempo_x100=*/12000, /*quantum=*/4);
+    ASSERT_EQ(b, 2);
+}
+
+TEST(beat_clock_two_beats_past) {
+    // 600ms past next_beat at 120 BPM (period 500ms) → one full extra
+    // beat has elapsed beyond the boundary, total advance = 2.
+    uint8_t b = firefly_current_beat_in_bar(
+        /*coord_now=*/2'100'000,
+        /*next_beat=*/1'500'000,
+        /*latest_beat=*/1, /*tempo_x100=*/12000, /*quantum=*/4);
+    ASSERT_EQ(b, 3);
+}
+
+TEST(beat_clock_wraps_bar) {
+    // From beat 3 advance by 2 → wraps to beat 1.
+    uint8_t b = firefly_current_beat_in_bar(
+        /*coord_now=*/2'100'000,
+        /*next_beat=*/1'500'000,
+        /*latest_beat=*/3, /*tempo_x100=*/12000, /*quantum=*/4);
+    ASSERT_EQ(b, 1);
+}
+
+TEST(beat_clock_dongle_and_wristband_agree) {
+    // Simulate the same wall-clock instant on dongle + wristband.
+    // Both compute coord_now using their own clock model and must
+    // produce the same beat.
+    int64_t coord_now = 5'000'000;
+    int64_t next_beat = 4'500'000; // already 500ms past → advance by 1+1=2
+    uint8_t latest_beat = 0;
+    uint16_t tempo = 12000;
+
+    // Dongle: estimates coord_now from latest_send + (now_local - packet_local)
+    int64_t latest_send = 4'400'000;
+    int64_t packet_local = 100'000;
+    int64_t now_local = packet_local + (coord_now - latest_send);
+    int64_t dongle_coord_now = latest_send + (now_local - packet_local);
+
+    // Wristband: coord_now = local + offset
+    int64_t wb_local = 9'000'000;
+    int64_t offset = coord_now - wb_local;
+    int64_t wb_coord_now = wb_local + offset;
+
+    uint8_t d = firefly_current_beat_in_bar(
+        dongle_coord_now, next_beat, latest_beat, tempo, 4);
+    uint8_t w = firefly_current_beat_in_bar(
+        wb_coord_now, next_beat, latest_beat, tempo, 4);
+    ASSERT_EQ(d, w);
+    ASSERT_EQ(d, 2);
+}
+
+TEST(beat_clock_unknown_next_beat) {
+    // Sentinel next_beat_us=0 → fall back to the snapshot beat.
+    uint8_t b = firefly_current_beat_in_bar(
+        /*coord_now=*/9'000'000, /*next_beat=*/0,
+        /*latest_beat=*/2, /*tempo_x100=*/12000, /*quantum=*/4);
+    ASSERT_EQ(b, 2);
+}
+
 // ── Main ───────────────────────────────────────────────────────────
 
 int main() {
@@ -550,6 +627,14 @@ int main() {
     printf("\nEnd-to-end:\n");
     run_e2e_packet_through_dongle_to_wristband();
     run_e2e_multi_beat_bar();
+
+    printf("\nBeat clock:\n");
+    run_beat_clock_before_next_beat();
+    run_beat_clock_just_after_next_beat();
+    run_beat_clock_two_beats_past();
+    run_beat_clock_wraps_bar();
+    run_beat_clock_dongle_and_wristband_agree();
+    run_beat_clock_unknown_next_beat();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

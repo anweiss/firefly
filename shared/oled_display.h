@@ -29,13 +29,14 @@ typedef struct {
 
 static inline bool firefly_oled_begin(oled_display_t *o) {
     Wire.begin();
-    // 400kHz I2C — SSD1306 full-frame transfer @100kHz blocks ~105ms on
-    // single-core C3, starving WiFi/ESP-NOW. 400kHz drops it to ~26ms.
-    Wire.setClock(400000);
     o->dev = new Adafruit_SSD1306(FIREFLY_OLED_W, FIREFLY_OLED_H, &Wire, -1);
     o->present = o->dev->begin(SSD1306_SWITCHCAPVCC, FIREFLY_OLED_ADDR);
     if (!o->present) return false;
-    // Adafruit_SSD1306::begin() may reset I2C clock; reapply.
+    // Bump to 400kHz AFTER begin() so initialization runs at the safe
+    // 100kHz default (some SSD1306 modules ACK at 0x3C but corrupt their
+    // command sequence at 400kHz during init). 400kHz is fine for
+    // subsequent frame data: drops 128x64 transfer from ~105ms to ~26ms,
+    // freeing the C3 to service ESP-NOW RX between refreshes.
     Wire.setClock(400000);
     o->dev->clearDisplay();
     o->dev->setTextColor(SSD1306_WHITE);
