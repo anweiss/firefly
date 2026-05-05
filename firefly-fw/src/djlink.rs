@@ -9,7 +9,7 @@
 //!
 //! Packet layout (Beat / CDJ Status share the same envelope):
 //! - bytes 0..10 : magic `Qspt1WmJOL` (0x51, 0x73, 0x70, 0x74, 0x31,
-//!                                     0x57, 0x6D, 0x4A, 0x4F, 0x4C)
+//!   0x57, 0x6D, 0x4A, 0x4F, 0x4C)
 //! - byte 10     : packet kind (0x28=Beat, 0x0A=CDJ status)
 //! - bytes 11..31: device name (ASCIIZ, 20 bytes)
 //! - byte 31     : sub-type / length-class (Beat=0x01)

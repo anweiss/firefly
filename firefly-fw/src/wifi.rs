@@ -8,9 +8,7 @@ use anyhow::{anyhow, Result};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{
-    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
-};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use heapless::String as HString;
 use log::info;
 
@@ -23,10 +21,7 @@ pub fn connect(
     sysloop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
 ) -> Result<BlockingWifi<EspWifi<'static>>> {
-    let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(modem, sysloop.clone(), Some(nvs))?,
-        sysloop,
-    )?;
+    let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sysloop.clone(), Some(nvs))?, sysloop)?;
 
     let mut ssid: HString<32> = HString::new();
     ssid.push_str(SSID).map_err(|_| anyhow!("SSID too long"))?;
@@ -63,7 +58,10 @@ pub fn connect(
             )
         }
         None => {
-            log::warn!("Wi-Fi: SSID '{}' not in scan results — proceeding with default WPA2", SSID);
+            log::warn!(
+                "Wi-Fi: SSID '{}' not in scan results — proceeding with default WPA2",
+                SSID
+            );
             (
                 if PASS.is_empty() {
                     AuthMethod::None

@@ -8,9 +8,7 @@
 
 use anyhow::Result;
 use esp_idf_svc::espnow::{EspNow, PeerInfo, BROADCAST};
-use esp_idf_svc::hal::sys::{
-    wifi_phy_rate_t_WIFI_PHY_RATE_1M_L,
-};
+use esp_idf_svc::hal::sys::wifi_phy_rate_t_WIFI_PHY_RATE_1M_L;
 use heapless::Vec;
 use log::{debug, info, warn};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -63,33 +61,40 @@ impl Broadcaster {
         // as unicast peer.
         let peers_cb = peers.clone();
         let stats_cb = stats.clone();
-        espnow.register_recv_cb(move |info: &esp_idf_svc::espnow::ReceiveInfo, data: &[u8]| {
-            let mac = &info.src_addr;
-            if data.len() == HELLO_SIZE
-                && data[0] == HELLO_SYNC[0]
-                && data[1] == HELLO_SYNC[1]
-            {
-                stats_cb.hellos_rx.fetch_add(1, Ordering::Relaxed);
-                let addr: [u8; 6] = **mac;
-                if let Ok(mut peers) = peers_cb.lock() {
-                    if !peers.iter().any(|p| *p == addr) && peers.push(addr).is_ok() {
-                        stats_cb.peer_count.store(peers.len() as u32, Ordering::Relaxed);
-                        info!(
+        espnow.register_recv_cb(
+            move |info: &esp_idf_svc::espnow::ReceiveInfo, data: &[u8]| {
+                let mac = &info.src_addr;
+                if data.len() == HELLO_SIZE && data[0] == HELLO_SYNC[0] && data[1] == HELLO_SYNC[1]
+                {
+                    stats_cb.hellos_rx.fetch_add(1, Ordering::Relaxed);
+                    let addr: [u8; 6] = **mac;
+                    if let Ok(mut peers) = peers_cb.lock() {
+                        if !peers.contains(&addr) && peers.push(addr).is_ok() {
+                            stats_cb
+                                .peer_count
+                                .store(peers.len() as u32, Ordering::Relaxed);
+                            info!(
                             "ESP-NOW: paired wristband {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
                             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]
                         );
+                        }
                     }
                 }
-            }
-        })?;
+            },
+        )?;
 
-        Ok(Self { espnow, peers, stats })
+        Ok(Self {
+            espnow,
+            peers,
+            stats,
+        })
     }
 
     pub fn stats(&self) -> Arc<Stats> {
         self.stats.clone()
     }
 
+    #[allow(dead_code)]
     pub fn peer_count(&self) -> usize {
         self.peers.lock().map(|p| p.len()).unwrap_or(0)
     }
@@ -108,7 +113,9 @@ impl Broadcaster {
     /// for redundancy (matches dongle firmware).
     pub fn send(&self, packet: &[u8]) -> Result<()> {
         match self.espnow.send(BROADCAST, packet) {
-            Ok(_) => { self.stats.tx_ok.fetch_add(1, Ordering::Relaxed); }
+            Ok(_) => {
+                self.stats.tx_ok.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) => {
                 let n = self.stats.tx_fail.fetch_add(1, Ordering::Relaxed);
                 // Rate-limit: ESP_ERR_ESPNOW_NO_MEM bursts during Wi-Fi
@@ -116,7 +123,11 @@ impl Broadcaster {
                 // supersedes the dropped frame). Log every 256th drop
                 // so the operator still sees if it goes pathological.
                 if n.is_power_of_two() {
-                    warn!("ESP-NOW broadcast send failed: {:?} (total fails: {})", e, n + 1);
+                    warn!(
+                        "ESP-NOW broadcast send failed: {:?} (total fails: {})",
+                        e,
+                        n + 1
+                    );
                 }
             }
         }

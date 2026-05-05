@@ -64,10 +64,12 @@ fn resolve_port_path(requested: Option<&str>) -> Result<String, String> {
 
     let candidates: Vec<&serialport::SerialPortInfo> = ports
         .iter()
-        .filter(|p| matches!(
-            &p.port_type,
-            serialport::SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_USB_VID
-        ))
+        .filter(|p| {
+            matches!(
+                &p.port_type,
+                serialport::SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_USB_VID
+            )
+        })
         .filter(|p| {
             // On macOS, serialport enumerates both /dev/tty.* (blocking)
             // and /dev/cu.* (non-blocking call-out). We always want cu.*.
@@ -83,8 +85,7 @@ fn resolve_port_path(requested: Option<&str>) -> Result<String, String> {
         ),
         1 => Ok(candidates[0].port_name.clone()),
         _ => {
-            let names: Vec<&str> =
-                candidates.iter().map(|p| p.port_name.as_str()).collect();
+            let names: Vec<&str> = candidates.iter().map(|p| p.port_name.as_str()).collect();
             Err(format!(
                 "multiple Espressif USB-CDC devices found ({}). \
                  Disambiguate with --port <path>.",
@@ -460,10 +461,7 @@ impl BeatSourceState {
         }
 
         let mut guard = 0;
-        while self.cdj_next_beat_us > 0
-            && link_clock_us >= self.cdj_next_beat_us
-            && guard < 8
-        {
+        while self.cdj_next_beat_us > 0 && link_clock_us >= self.cdj_next_beat_us && guard < 8 {
             self.cdj_beat_in_bar = (self.cdj_beat_in_bar + 1) % 4;
             // The boundary we just crossed *was* `cdj_next_beat_us`.
             // Use it (not `last_smoothed_beat_us`) to derive the new
@@ -868,8 +866,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Re-resolve the port on reconnect — usbmodem paths can
                 // change after a device reset, and the user may have
                 // swapped dongles.
-                let reconnect_path = resolve_port_path(args.port.as_deref())
-                    .unwrap_or_else(|_| port_path.clone());
+                let reconnect_path =
+                    resolve_port_path(args.port.as_deref()).unwrap_or_else(|_| port_path.clone());
                 match serialport::new(&reconnect_path, args.baud)
                     .timeout(Duration::from_millis(100))
                     .open()

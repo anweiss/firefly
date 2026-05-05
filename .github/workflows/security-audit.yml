@@ -16,9 +16,13 @@ jobs:
   audit:
     name: Cargo audit
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [coordinator, firefly-fw]
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: coordinator
+          working-directory: ${{ matrix.workspace }}

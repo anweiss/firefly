@@ -14,7 +14,7 @@
 //! at most every 250 ms (matches the dongle's `ulTaskNotifyTake` cadence).
 
 use anyhow::Result;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -163,9 +163,16 @@ where
                 .fill_color(BinaryColor::On)
                 .build(),
         )
-        .draw(disp).ok();
-    Text::with_baseline("Firefly DNG", Point::new(2, 1), *inverted_style, Baseline::Top)
-        .draw(disp).ok();
+        .draw(disp)
+        .ok();
+    Text::with_baseline(
+        "Firefly DNG",
+        Point::new(2, 1),
+        *inverted_style,
+        Baseline::Top,
+    )
+    .draw(disp)
+    .ok();
 
     // bpm / live / beat-in-bar
     let tempo_x100 = state.tempo_x100.load(Ordering::Relaxed);
@@ -182,13 +189,15 @@ where
         beat as u32 + 1
     );
     Text::with_baseline(line.as_str(), Point::new(0, 13), *text_style, Baseline::Top)
-        .draw(disp).ok();
+        .draw(disp)
+        .ok();
 
     // fwd
     let mut line: Line = Line::new();
     let _ = write!(line, "fwd: {}", stats.tx_ok.load(Ordering::Relaxed));
     Text::with_baseline(line.as_str(), Point::new(0, 24), *text_style, Baseline::Top)
-        .draw(disp).ok();
+        .draw(disp)
+        .ok();
 
     // tx ok/fail
     let mut line: Line = Line::new();
@@ -199,7 +208,8 @@ where
         stats.tx_fail.load(Ordering::Relaxed),
     );
     Text::with_baseline(line.as_str(), Point::new(0, 35), *text_style, Baseline::Top)
-        .draw(disp).ok();
+        .draw(disp)
+        .ok();
 
     // channel + peers + hellos
     let ch = current_wifi_channel();
@@ -212,9 +222,11 @@ where
         stats.hellos_rx.load(Ordering::Relaxed),
     );
     Text::with_baseline(line.as_str(), Point::new(0, 46), *text_style, Baseline::Top)
-        .draw(disp).ok();
+        .draw(disp)
+        .ok();
 
-    let _ = disp.flush(); Ok(())
+    let _ = disp.flush();
+    Ok(())
 }
 
 fn current_wifi_channel() -> u8 {

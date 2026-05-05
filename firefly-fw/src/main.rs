@@ -78,7 +78,10 @@ fn main() -> Result<()> {
     let _wifi = match wifi::connect(peripherals.modem, sysloop, nvs) {
         Ok(w) => w,
         Err(e) => {
-            warn!("Wi-Fi connect failed: {}. Halting — ESP-NOW requires Wi-Fi init.", e);
+            warn!(
+                "Wi-Fi connect failed: {}. Halting — ESP-NOW requires Wi-Fi init.",
+                e
+            );
             // Sleep forever rather than panic; lets the user see the log.
             loop {
                 thread::sleep(Duration::from_secs(60));
@@ -125,7 +128,10 @@ fn main() -> Result<()> {
     let mut state = BeatSourceState::new();
     let mut next_tick = Instant::now();
 
-    info!("firefly-fw running — broadcasting v2 packets at {} Hz", BROADCAST_HZ);
+    info!(
+        "firefly-fw running — broadcasting v2 packets at {} Hz",
+        BROADCAST_HZ
+    );
 
     loop {
         // ── Drain DJ Link events ────────────────────────────────────
@@ -142,17 +148,15 @@ fn main() -> Result<()> {
                         state.process_master_beat(&beat, now_instant, now_us);
                     }
                 }
-                Ok(DjLinkEvent::Status(status)) => {
-                    match state.process_cdj_status(&status) {
-                        CdjPlayTransition::Paused => {
-                            info!("CDJ master paused/cued");
-                        }
-                        CdjPlayTransition::PlayStarted => {
-                            info!("CDJ master play/cue pressed — firing immediate flash");
-                        }
-                        CdjPlayTransition::None => {}
+                Ok(DjLinkEvent::Status(status)) => match state.process_cdj_status(&status) {
+                    CdjPlayTransition::Paused => {
+                        info!("CDJ master paused/cued");
                     }
-                }
+                    CdjPlayTransition::PlayStarted => {
+                        info!("CDJ master play/cue pressed — firing immediate flash");
+                    }
+                    CdjPlayTransition::None => {}
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     warn!("DJ Link channel disconnected");

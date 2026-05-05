@@ -21,6 +21,54 @@ jobs:
       - run: cargo fmt --all -- --check
         working-directory: coordinator
 
+  firefly-fw-fmt:
+    name: firefly-fw rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+        working-directory: firefly-fw
+
+  firefly-fw-clippy:
+    name: firefly-fw clippy + build (esp32c3)
+    runs-on: ubuntu-latest
+    env:
+      # Required at build time by firefly-fw/src/wifi.rs (env! macros).
+      # Real credentials live only on the device — CI uses placeholders.
+      WIFI_SSID: ci-firefly
+      WIFI_PASS: ci-firefly-pass
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ESP-IDF host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git wget flex bison gperf python3 python3-pip python3-venv \
+            cmake ninja-build ccache libffi-dev libssl-dev dfu-util \
+            libusb-1.0-0
+      # esp-rs canonical action: installs the Rust ESP toolchain and
+      # ldproxy linker shim for the requested ESP target. Despite the
+      # name "xtensa-toolchain" it also sets up RISC-V (esp32c3/c6/h2).
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32c3
+          ldproxy: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firefly-fw
+          cache-on-failure: true
+          # esp-idf-sys downloads the ESP-IDF C SDK (~1 GB) into
+          # ~/.cargo's checkout dirs the first time. Cache those across
+          # runs to keep cold CI build under ~5 minutes.
+          shared-key: firefly-fw-esp32c3
+      - name: Clippy (lint + cross-compile to riscv32imc-esp-espidf)
+        run: cargo clippy --release --all-targets -- -D warnings
+        working-directory: firefly-fw
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

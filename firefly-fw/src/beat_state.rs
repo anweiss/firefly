@@ -15,6 +15,7 @@ use std::time::Instant;
 pub const CDJ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum BPM difference before we propagate a tempo change.
+#[allow(dead_code)]
 pub const TEMPO_EPSILON: f64 = 0.05;
 
 /// Decoded Pro DJ Link Beat packet (subset that the coordinator uses).
@@ -184,8 +185,7 @@ impl BeatSourceState {
     }
 
     pub fn check_cdj_timeout(&mut self, now: Instant) -> bool {
-        if self.cdj_playing
-            && now.saturating_duration_since(self.last_cdj_beat_time) > CDJ_TIMEOUT
+        if self.cdj_playing && now.saturating_duration_since(self.last_cdj_beat_time) > CDJ_TIMEOUT
         {
             self.cdj_playing = false;
             self.have_smoothed_beat = false;
@@ -197,8 +197,7 @@ impl BeatSourceState {
     }
 
     pub fn is_cdj_active(&self, now: Instant) -> bool {
-        self.cdj_playing
-            && now.saturating_duration_since(self.last_cdj_beat_time) < CDJ_TIMEOUT
+        self.cdj_playing && now.saturating_duration_since(self.last_cdj_beat_time) < CDJ_TIMEOUT
     }
 
     pub fn tick_predicted_beats(&mut self, link_clock_us: i64) -> bool {
@@ -220,10 +219,7 @@ impl BeatSourceState {
         }
 
         let mut guard = 0;
-        while self.cdj_next_beat_us > 0
-            && link_clock_us >= self.cdj_next_beat_us
-            && guard < 8
-        {
+        while self.cdj_next_beat_us > 0 && link_clock_us >= self.cdj_next_beat_us && guard < 8 {
             self.cdj_beat_in_bar = (self.cdj_beat_in_bar + 1) % 4;
             let just_advanced_at = self.cdj_next_beat_us;
             self.cdj_next_beat_us += beat_period_us;
@@ -249,6 +245,7 @@ impl BeatSourceState {
         mask
     }
 
+    #[allow(dead_code)]
     pub fn update_on_air(&mut self, channels: HashMap<u8, bool>) {
         self.channels_on_air = channels;
     }
