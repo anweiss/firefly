@@ -76,6 +76,27 @@ fn main() -> Result<()> {
     let adc1 = peripherals.adc1;
     let vbat_pin = peripherals.pins.gpio4;
 
+    // Pre-create the shared state + stats so the OLED task can render
+    // boot/wifi-connect status BEFORE wifi::connect blocks. The same
+    // Arc<Stats> is later passed into Broadcaster::new.
+    let live_state = Arc::new(LiveState::default());
+    let stats = Arc::new(crate::espnow::Stats::default());
+
+    // OLED display task — spawned BEFORE wifi.connect so the user sees
+    // "wifi: connecting..." status during the (sometimes lengthy) AP
+    // scan / association phase. Silently no-ops if no display.
+    if let Err(e) = display::spawn(
+        i2c0,
+        sda,
+        scl,
+        adc1,
+        vbat_pin,
+        live_state.clone(),
+        stats.clone(),
+    ) {
+        warn!("OLED: failed to spawn display thread: {:?}", e);
+    }
+
     // Wi-Fi must be up before EspNow::take() (ESP-NOW rides the same
     // radio interface). On failure we still proceed — without Wi-Fi
     // there's no DJ Link, but ESP-NOW alone can broadcast a free-running
@@ -94,16 +115,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let broadcaster = Broadcaster::new()?;
-    let stats = broadcaster.stats();
-
-    // OLED display task. Mirrors the dongle firmware's dedicated
-    // FreeRTOS task — runs on its own thread so I²C latency cannot
-    // gallop the 200 Hz broadcast loop. Silently no-ops if no display.
-    let live_state = Arc::new(LiveState::default());
-    if let Err(e) = display::spawn(i2c0, sda, scl, adc1, vbat_pin, live_state.clone(), stats.clone()) {
-        warn!("OLED: failed to spawn display thread: {:?}", e);
-    }
+    let broadcaster = Broadcaster::new(stats.clone())?;
 
     // DJ Link receive thread → main loop via mpsc.
     let (dj_tx, dj_rx) = channel::<DjLinkEvent>();

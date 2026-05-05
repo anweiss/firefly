@@ -35,7 +35,7 @@ pub struct Broadcaster {
 }
 
 impl Broadcaster {
-    pub fn new() -> Result<Self> {
+    pub fn new(stats: Arc<Stats>) -> Result<Self> {
         let espnow = EspNow::take()?;
 
         // Add broadcast peer
@@ -54,7 +54,6 @@ impl Broadcaster {
         espnow.add_peer(peer)?;
 
         let peers = Arc::new(Mutex::new(Vec::new()));
-        let stats = Arc::new(Stats::default());
 
         // Hello-frame ingest: wristbands send 8-byte hello packets every
         // 1 s when idle / 5 s when live. Capture the source MAC and add
@@ -90,6 +89,7 @@ impl Broadcaster {
         })
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> Arc<Stats> {
         self.stats.clone()
     }

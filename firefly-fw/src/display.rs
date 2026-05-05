@@ -304,15 +304,27 @@ where
         .draw(disp)
         .ok();
 
-    // channel + peers + hellos
+    // channel + peers + hellos + wifi state. Wifi probed live via
+    // esp_wifi_sta_get_ap_info — ESP_OK = connected (rssi available),
+    // ESP_ERR_WIFI_NOT_CONNECT = scanning/associating, anything else
+    // (incl. NOT_INIT/NOT_STARTED) treated as down.
     let ch = current_wifi_channel();
     let mut line: Line = Line::new();
+    match wifi_link_status() {
+        WifiLink::Connected(rssi) => {
+            let _ = write!(line, "ch:{} W:{}dB", ch, rssi);
+        }
+        WifiLink::Connecting => {
+            let _ = write!(line, "ch:{} W:..", ch);
+        }
+        WifiLink::Down => {
+            let _ = write!(line, "ch:{} W:NO", ch);
+        }
+    }
     let _ = write!(
         line,
-        "ch : {} p:{} h:{}",
-        ch,
+        " p:{}",
         stats.peer_count.load(Ordering::Relaxed),
-        stats.hellos_rx.load(Ordering::Relaxed),
     );
     Text::with_baseline(line.as_str(), Point::new(0, 35), *text_style, Baseline::Top)
         .draw(disp)
@@ -344,4 +356,25 @@ fn current_wifi_channel() -> u8 {
         esp_idf_svc::hal::sys::esp_wifi_get_channel(&mut pri, &mut sec);
     }
     pri
+}
+
+enum WifiLink {
+    Connected(i8),
+    Connecting,
+    Down,
+}
+
+fn wifi_link_status() -> WifiLink {
+    use esp_idf_svc::hal::sys::{
+        esp_wifi_sta_get_ap_info, wifi_ap_record_t, ESP_ERR_WIFI_NOT_CONNECT, ESP_OK,
+    };
+    let mut info: wifi_ap_record_t = unsafe { core::mem::zeroed() };
+    let err = unsafe { esp_wifi_sta_get_ap_info(&mut info) };
+    if err == ESP_OK {
+        WifiLink::Connected(info.rssi)
+    } else if err == ESP_ERR_WIFI_NOT_CONNECT {
+        WifiLink::Connecting
+    } else {
+        WifiLink::Down
+    }
 }
