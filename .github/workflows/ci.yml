@@ -119,7 +119,7 @@ jobs:
         run: |
           arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli lib install FastLED
+          arduino-cli lib install FastLED "Adafruit GFX Library" "Adafruit SSD1306"
       - name: Compile dongle firmware
         run: arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 dongle-firmware/
       - name: Compile wristband firmware
