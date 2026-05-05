@@ -358,7 +358,11 @@ void setup() {
     Serial.begin(115200);
     // Make CDC writes non-blocking — when there is no USB host,
     // a stalled TX would otherwise stall setup() up to 1s per call.
+    // Only available on the HWCDC class (ESP32 Arduino core 3.x with
+    // USB CDC on boot), which is what `Serial` is on the XIAO C3.
+#if ARDUINO_USB_CDC_ON_BOOT
     Serial.setTxTimeoutMs(0);
+#endif
     Serial.println("Firefly Wristband v0.2 (protocol v2)");
 
     // Pin CPU at 160 MHz (max for C3) so WiFi/ESP-NOW timing is stable
