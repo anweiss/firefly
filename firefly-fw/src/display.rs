@@ -120,6 +120,12 @@ fn run(
         warn!("OLED: SSD1306 init failed ({:?}); display absent", e);
         return Ok(());
     }
+    // Match the wristband / dongle Adafruit_SSD1306 default contrast
+    // (0xCF for SWITCHCAPVCC). The ssd1306 crate's default is much
+    // dimmer (NORMAL = 0x5F).
+    if let Err(e) = disp.set_brightness(Brightness::BRIGHTEST) {
+        warn!("OLED: set_brightness failed ({:?})", e);
+    }
     info!("OLED: SSD1306 ready @ 0x{:02X}", OLED_ADDR);
 
     // ADC oneshot driver for battery sense. If it fails to initialise
