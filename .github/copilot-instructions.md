@@ -108,9 +108,34 @@ CI runs all of these on every push and PR — see `.github/workflows/ci.yml`.
   against the firmware simulators in `coordinator/src/firmware_sim.rs`
   (DongleSim + WristbandSim) AND mirrored in `firefly-fw/src/protocol.rs`.
 
+## Documentation
+
+Three doc surfaces must stay in sync with the code. **Update the
+relevant ones whenever you change behaviour, architecture, build
+process, or deployment story** — not just when adding features:
+
+| File | Scope | Update when… |
+|---|---|---|
+| `README.md` (root) | High-level overview, both deployment paths, Quick Start, ESP-NOW topology | Components added/removed, build commands change, ESP-NOW parameters change, CI surface changes |
+| `firefly-fw/README.md` | firefly-fw module map, toolchain, build/flash, operational notes (100 Hz, antenna, PHY rate), gaps vs host coordinator | Any firefly-fw module added/removed, env-var contract changes, broadcast rate / PHY / channel changes, new "what's not yet ported" item resolved |
+| `.github/copilot-instructions.md` | This file — conventions, validation matrix, gotchas | New convention discovered, new gotcha encountered, validation steps change |
+
+There is also a separate **`firefly-docs` repo** at
+`~/Development/anweiss/firefly-docs` (https://github.com/anweiss/firefly-docs)
+covering architecture, protocol spec, project history, and planning.
+**When you make a non-trivial change here, also update firefly-docs
+in the same logical change** — typically `architecture.md` (system
+design), `protocol-v2.md` (wire format / rates / framing), and
+`project-history.md` (append a milestone for major changes). It runs
+markdownlint-cli2 in CI; verify locally with
+`cd ~/Development/anweiss/firefly-docs && npx -y markdownlint-cli2 '**/*.md'`
+before pushing.
+
 ## Git Conventions
 
 - Conventional commits — title format validated by
   `.github/workflows/conventional-commits.yml`.
 - Allowed types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
   `test`, `build`, `chore`, `ci`.
+- Always include the `Co-authored-by: Copilot
+  <223556219+Copilot@users.noreply.github.com>` trailer.
